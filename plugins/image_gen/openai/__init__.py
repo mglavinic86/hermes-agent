@@ -173,7 +173,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         return "OpenAI"
 
     def is_available(self) -> bool:
-        if not os.environ.get("OPENAI_API_KEY"):
+        if not os.environ.get("OPENAI_IMAGE_API_KEY"):
             return False
         try:
             import openai  # noqa: F401
@@ -203,8 +203,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
             "tag": "gpt-image-2 at low/medium/high quality tiers — text-to-image & image editing",
             "env_vars": [
                 {
-                    "key": "OPENAI_API_KEY",
-                    "prompt": "OpenAI API key",
+                    "key": "OPENAI_IMAGE_API_KEY",
+                    "prompt": "OpenAI image API key",
                     "url": "https://platform.openai.com/api-keys",
                 },
             ],
@@ -235,10 +235,11 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        if not os.environ.get("OPENAI_API_KEY"):
+        image_api_key = os.environ.get("OPENAI_IMAGE_API_KEY", "").strip()
+        if not image_api_key:
             return error_response(
                 error=(
-                    "OPENAI_API_KEY not set. Run `hermes tools` → Image "
+                    "OPENAI_IMAGE_API_KEY not set. Run `hermes tools` → Image "
                     "Generation → OpenAI to configure, or `hermes setup` "
                     "to add the key."
                 ),
@@ -270,7 +271,31 @@ class OpenAIImageGenProvider(ImageGenProvider):
         is_edit = bool(sources)
         modality = "image" if is_edit else "text"
 
-        client = openai.OpenAI()
+        from tools.openai_media_spend import (
+            SpendPolicyError,
+            gate as spend_gate,
+            image_cost,
+            image_preflight_usd,
+            record as spend_record,
+        )
+        try:
+            spend_gate(
+                "image_generation",
+                API_MODEL,
+                image_preflight_usd(meta["quality"], size, len(sources)),
+                {"quality": meta["quality"], "size": size, "source_count": len(sources)},
+            )
+        except SpendPolicyError as exc:
+            return error_response(
+                error=f"OpenAI spend policy blocked image generation: {exc}",
+                error_type="spend_policy",
+                provider="openai",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        client = openai.OpenAI(api_key=image_api_key)
 
         if is_edit:
             # images.edit() expects file-like objects. Download/read each
@@ -337,6 +362,38 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect,
                 )
 
+        try:
+            cost_usd, usage, is_cost_estimated, usage_details = image_cost(
+                response, meta["quality"], size, len(sources), prompt
+            )
+            spend_record(
+                "image_generation",
+                API_MODEL,
+                cost_usd,
+                input_tokens=usage["input_tokens"],
+                cached_tokens=usage["cached_tokens"],
+                output_tokens=usage["output_tokens"],
+                estimated=is_cost_estimated,
+                metadata={
+                    "tier": tier_id,
+                    "quality": meta["quality"],
+                    "size": size,
+                    "source_count": len(sources),
+                    "modality": modality,
+                    "usage_source": "fallback_estimate" if is_cost_estimated else "openai_response",
+                    "usage_details": usage_details,
+                },
+            )
+        except SpendPolicyError as exc:
+            return error_response(
+                error=f"OpenAI image generated but spend tracking failed: {exc}",
+                error_type="spend_tracking",
+                provider="openai",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
         data = getattr(response, "data", None) or []
         if not data:
             return error_response(
@@ -392,7 +449,12 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
+        extra: Dict[str, Any] = {
+            "size": size,
+            "quality": meta["quality"],
+            "cost_usd": cost_usd,
+            "cost_estimated": is_cost_estimated,
+        }
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt
 

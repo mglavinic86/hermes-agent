@@ -1381,6 +1381,34 @@ def _transcribe_openai(
 
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
+
+        # Cost gating is intentionally limited to the native OpenAI path. This
+        # function also serves third-party OpenAI-compatible STT endpoints,
+        # whose pricing and credentials are governed separately.
+        duration_seconds = None
+        if provider_label == "openai":
+            from tools.openai_media_spend import (
+                SpendPolicyError,
+                audio_duration_seconds,
+                gate as spend_gate,
+                transcription_preflight_usd,
+            )
+
+            try:
+                duration_seconds = audio_duration_seconds(file_path)
+                spend_gate(
+                    "transcription",
+                    model_name,
+                    transcription_preflight_usd(duration_seconds),
+                    {"duration_seconds": round(duration_seconds, 3)},
+                )
+            except SpendPolicyError as exc:
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": f"OpenAI spend policy blocked transcription: {exc}",
+                }
+
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
         try:
             with open(file_path, "rb") as audio_file:
@@ -1391,12 +1419,49 @@ def _transcribe_openai(
                 )
 
             transcript_text = _extract_transcript_text(transcription)
+            result: Dict[str, Any] = {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": provider_label,
+            }
+            if provider_label == "openai" and duration_seconds is not None:
+                from tools.openai_media_spend import (
+                    record as spend_record,
+                    transcription_cost,
+                )
+
+                cost_usd, usage, is_estimated = transcription_cost(
+                    transcription, duration_seconds
+                )
+                spend_record(
+                    "transcription",
+                    model_name,
+                    cost_usd,
+                    input_tokens=usage["input_tokens"],
+                    cached_tokens=usage["cached_tokens"],
+                    output_tokens=usage["output_tokens"],
+                    estimated=is_estimated,
+                    metadata={
+                        "duration_seconds": round(duration_seconds, 3),
+                        "usage_source": (
+                            "duration_estimate" if is_estimated else "openai_response"
+                        ),
+                    },
+                )
+                result.update(
+                    {
+                        "model": model_name,
+                        "cost_usd": cost_usd,
+                        "cost_estimated": is_estimated,
+                    }
+                )
+
             logger.info(
                 "Transcribed %s via %s (%s, %d chars)",
                 Path(file_path).name, provider_label, model_name, len(transcript_text),
             )
 
-            return {"success": True, "transcript": transcript_text, "provider": provider_label}
+            return result
         finally:
             close = getattr(client, "close", None)
             if callable(close):
