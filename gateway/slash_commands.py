@@ -27,7 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -89,6 +89,7 @@ class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
+    _active_cron_job_count: Callable[[], int]
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -1271,6 +1272,23 @@ class GatewaySlashCommandsMixin:
             if count:
                 return t("gateway.draining", count=count)
             return EphemeralReply(t("gateway.restart.in_progress"))
+
+        # Never let an in-chat restart enter the destructive drain path while
+        # cron worker threads are alive.  A timed-out drain can interrupt their
+        # tool subprocesses and, before the CLI exit backstop was wired through
+        # the real ``hermes_cli.main`` entrypoint, strand the gateway after all
+        # adapters disconnected.  The operator can retry once cron is idle; an
+        # external service restart remains the explicit recovery escape hatch.
+        active_cron_jobs = self._active_cron_job_count()
+        if active_cron_jobs:
+            logger.warning(
+                "Refusing /restart while %d cron job(s) are in flight",
+                active_cron_jobs,
+            )
+            return EphemeralReply(
+                f"⛔ Restart refused: {active_cron_jobs} cron job(s) are still "
+                "running. Wait for them to finish, then retry /restart."
+            )
 
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.

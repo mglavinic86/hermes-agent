@@ -78,6 +78,35 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_restart_command_refuses_while_cron_jobs_are_in_flight(tmp_path, monkeypatch):
+    """An in-chat restart must never enter the destructive 180s drain while
+    cron worker threads are alive; wait for them or use an external operator.
+    """
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    runner._active_cron_job_count = MagicMock(return_value=2)
+
+    source = make_restart_source(chat_id="42")
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+    )
+
+    result = await runner._handle_restart_command(event)
+
+    assert "2" in str(result)
+    assert "cron" in str(result).lower()
+    assert "odb" in str(result).lower() or "refus" in str(result).lower()
+    runner.request_restart.assert_not_called()
+    assert not (tmp_path / ".restart_notify.json").exists()
+    assert not (tmp_path / ".restart_last_processed.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_restart_command_uses_service_restart_under_systemd(tmp_path, monkeypatch):
     """Under systemd (INVOCATION_ID set), /restart uses via_service=True."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)

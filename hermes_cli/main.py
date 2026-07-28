@@ -2623,12 +2623,41 @@ def cmd_chat(args):
 
 
 def cmd_gateway(args):
-    """Gateway management commands."""
+    """Gateway management commands.
+
+    ``hermes gateway run`` enters through this top-level CLI dispatcher, not
+    ``gateway.run.main``.  After graceful teardown it must use the same
+    ``os._exit`` backstop as the direct gateway entrypoint; otherwise Python
+    finalization waits for non-daemon cron/tool worker threads and a launchd
+    restart can remain half-stopped forever.
+    """
     _sync_bundled_skills_quietly()
 
     from hermes_cli.gateway import gateway_command
 
-    gateway_command(args)
+    is_gateway_run = getattr(args, "gateway_command", None) == "run"
+    try:
+        gateway_command(args)
+    except SystemExit as exc:
+        if not is_gateway_run:
+            raise
+        if exc.code is None:
+            exit_code = 0
+        elif isinstance(exc.code, int):
+            exit_code = exc.code
+        else:
+            exit_code = 1
+        import importlib
+
+        _gateway_run = importlib.import_module("gateway.run")
+        _gateway_run._exit_after_graceful_shutdown(exit_code)
+        return
+
+    if is_gateway_run:
+        import importlib
+
+        _gateway_run = importlib.import_module("gateway.run")
+        _gateway_run._exit_after_graceful_shutdown(0)
 
 
 def cmd_proxy(args):
