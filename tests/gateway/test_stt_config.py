@@ -1,5 +1,6 @@
-"""Gateway STT config tests — honor stt.enabled: false from config.yaml."""
+"""Gateway STT config tests — config bridging and fail-open voice handling."""
 
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -14,6 +15,17 @@ from gateway.session import SessionSource
 def test_gateway_config_stt_disabled_from_dict_nested():
     config = GatewayConfig.from_dict({"stt": {"enabled": False}})
     assert config.stt_enabled is False
+
+
+def test_gateway_config_stt_timeout_defaults_and_accepts_nested_override():
+    assert GatewayConfig.from_dict({}).stt_timeout_seconds == 45.0
+    config = GatewayConfig.from_dict({"stt": {"gateway_timeout_seconds": 12.5}})
+    assert config.stt_timeout_seconds == 12.5
+
+
+def test_gateway_config_stt_timeout_rejects_invalid_values():
+    assert GatewayConfig.from_dict({"stt": {"gateway_timeout_seconds": 0}}).stt_timeout_seconds == 45.0
+    assert GatewayConfig.from_dict({"stt": {"gateway_timeout_seconds": "bad"}}).stt_timeout_seconds == 45.0
 
 
 def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monkeypatch):
@@ -100,6 +112,36 @@ async def test_enrich_message_with_transcription_avoids_bogus_no_provider_messag
     assert "[voice message could not be transcribed]" in result
     # The opaque backend cause must NOT leak into the LLM-visible prompt.
     assert "VOICE_TOOLS_OPENAI_KEY" not in result
+    assert "caption" in result
+    assert transcripts == []
+
+
+@pytest.mark.asyncio
+async def test_enrich_message_with_transcription_times_out_fail_open():
+    """A stuck STT worker must not hold the gateway/chat lock indefinitely."""
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True, stt_timeout_seconds=0.01)
+    release_worker = threading.Event()
+
+    def stuck_transcription(_path):
+        release_worker.wait(timeout=5)
+        return {"success": True, "transcript": "too late"}
+
+    try:
+        with patch(
+            "tools.transcription_tools.transcribe_audio",
+            side_effect=stuck_transcription,
+        ):
+            result, transcripts = await runner._enrich_message_with_transcription(
+                "caption",
+                ["/tmp/stuck-voice.ogg"],
+            )
+    finally:
+        release_worker.set()
+
+    assert "[voice message could not be transcribed]" in result
     assert "caption" in result
     assert transcripts == []
 

@@ -101,6 +101,12 @@ def _coerce_float(value: Any, default: float) -> float:
         return default
 
 
+def _coerce_positive_float(value: Any, default: float) -> float:
+    """Coerce a positive float, falling back for zero/negative/invalid values."""
+    parsed = _coerce_float(value, default)
+    return parsed if parsed > 0 else default
+
+
 def _coerce_int(value: Any, default: int) -> int:
     """Coerce integer config values, falling back on malformed input."""
     if value is None:
@@ -865,6 +871,9 @@ class GatewayConfig:
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
+    # Hard gateway deadline around the complete STT worker. Provider-level
+    # HTTP/process timeouts are insufficient when setup or cleanup itself hangs.
+    stt_timeout_seconds: float = 45.0
 
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
@@ -1011,6 +1020,7 @@ class GatewayConfig:
             "filter_silence_narration": self.filter_silence_narration,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
+            "stt_timeout_seconds": self.stt_timeout_seconds,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
@@ -1073,6 +1083,14 @@ class GatewayConfig:
                 if isinstance(data.get("stt"), dict)
                 else None
             )
+        stt_timeout_raw = data.get("stt_timeout_seconds")
+        if stt_timeout_raw is None:
+            stt_timeout_raw = (
+                data.get("stt", {}).get("gateway_timeout_seconds")
+                if isinstance(data.get("stt"), dict)
+                else None
+            )
+        stt_timeout_seconds = _coerce_positive_float(stt_timeout_raw, 45.0)
 
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
@@ -1143,6 +1161,7 @@ class GatewayConfig:
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
+            stt_timeout_seconds=stt_timeout_seconds,
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),

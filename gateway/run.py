@@ -16615,10 +16615,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         enriched_parts = []
         successful_transcripts: List[str] = []
+        stt_timeout_seconds = getattr(self.config, "stt_timeout_seconds", 45.0)
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(transcribe_audio, path),
+                    timeout=stt_timeout_seconds,
+                )
                 if result["success"]:
                     transcript = result["transcript"]
                     successful_transcripts.append(transcript)
@@ -16641,6 +16645,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # LLM-visible prompt.
                     logger.info("Voice transcription failed for %s: %s", path, error)
                     enriched_parts.append("[voice message could not be transcribed]")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Voice transcription timed out after %.1fs for %s; continuing fail-open",
+                    stt_timeout_seconds,
+                    path,
+                )
+                enriched_parts.append("[voice message could not be transcribed]")
             except Exception as e:
                 logger.error("Transcription error: %s", e)
                 enriched_parts.append("[voice message could not be transcribed]")
