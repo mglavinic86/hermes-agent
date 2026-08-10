@@ -209,12 +209,19 @@ def _create_reviewer_snapshot(home: Path) -> Path:
     return skill_dir
 
 
-def _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch):
+def _dispatch_pinned_reviewer_and_capture_child_env(
+    kanban_home,
+    monkeypatch,
+    *,
+    skill_text: str | None = None,
+):
     """Run the real durable dispatcher/default-spawn path up to child exec."""
     from hermes_cli import profiles
 
     monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
     skill_dir = _create_reviewer_snapshot(kanban_home)
+    if skill_text is not None:
+        (skill_dir / "SKILL.md").write_text(skill_text, encoding="utf-8")
     expected_digest = _profile_skill_digest("reviewer", "immutable-change-reviews")
     assert expected_digest is not None
     captured: dict = {}
@@ -1776,6 +1783,70 @@ def test_pinned_reviewer_rejects_mutated_verified_snapshot_bytes(
     assert prompt == ""
     assert loaded == []
     assert missing == ["immutable-change-reviews"]
+
+
+def test_pinned_reviewer_disables_inline_shell_after_snapshot_verification(
+    kanban_home, monkeypatch
+):
+    """Pinned bytes must not trigger post-verification reads from the live tree."""
+    from agent import skill_commands, skill_preprocessing
+    from tools.skills_tool import skill_view
+
+    inline_skill = (
+        "---\nname: immutable-change-reviews\n---\n"
+        "# Immutable Review\n"
+        "Verified literal: !`cat SKILL.md`\n"
+    )
+    _skill_dir, _expected_digest, child_env = (
+        _dispatch_pinned_reviewer_and_capture_child_env(
+            kanban_home,
+            monkeypatch,
+            skill_text=inline_skill,
+        )
+    )
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+
+    shell_calls: list[str] = []
+    monkeypatch.setattr(
+        skill_commands,
+        "_load_skills_config",
+        lambda: {"template_vars": True, "inline_shell": True},
+    )
+    monkeypatch.setattr(
+        skill_commands,
+        "_expand_inline_shell",
+        lambda content, *_args: shell_calls.append("preload")
+        or "MUTATED_UNCHECKED_BODY",
+    )
+    monkeypatch.setattr(
+        skill_preprocessing,
+        "load_skills_config",
+        lambda: {"template_vars": True, "inline_shell": True},
+    )
+    monkeypatch.setattr(
+        skill_preprocessing,
+        "run_inline_shell",
+        lambda *_args, **_kwargs: shell_calls.append("skill_view")
+        or "MUTATED_UNCHECKED_BODY",
+    )
+
+    prompt, loaded, missing = skill_commands.build_preloaded_skills_prompt(
+        ["immutable-change-reviews"]
+    )
+    assert loaded == ["immutable-change-reviews"]
+    assert missing == []
+    assert "Verified literal: !`cat SKILL.md`" in prompt
+    assert "MUTATED_UNCHECKED_BODY" not in prompt
+    assert "dispatcher-verified snapshot" in prompt
+    assert str(_skill_dir) not in prompt
+    assert "run scripts directly" not in prompt
+
+    viewed = json.loads(skill_view("immutable-change-reviews", preprocess=True))
+    assert viewed["success"] is True
+    assert "Verified literal: !`cat SKILL.md`" in viewed["content"]
+    assert "MUTATED_UNCHECKED_BODY" not in viewed["content"]
+    assert shell_calls == []
 
 
 def test_durable_review_without_pinned_digest_never_spawns(

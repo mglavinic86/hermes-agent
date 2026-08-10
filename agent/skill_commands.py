@@ -280,6 +280,7 @@ def _build_skill_message(
     from tools.skills_tool import SKILLS_DIR
 
     content = str(loaded_skill.get("content") or "")
+    pinned_snapshot_verified = bool(loaded_skill.get("_pinned_snapshot_verified"))
 
     # ── Template substitution and inline-shell expansion ──
     # Done before anything else so downstream blocks (setup notes,
@@ -287,7 +288,10 @@ def _build_skill_message(
     skills_cfg = _load_skills_config()
     if skills_cfg.get("template_vars", True):
         content = _substitute_template_vars(content, skill_dir, session_id)
-    if skills_cfg.get("inline_shell", False):
+    if (
+        skills_cfg.get("inline_shell", False)
+        and not pinned_snapshot_verified
+    ):
         timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
         content = _expand_inline_shell(content, skill_dir, timeout)
 
@@ -297,12 +301,19 @@ def _build_skill_message(
     #    bundled scripts without an extra skill_view() round-trip. ──
     if skill_dir:
         parts.append("")
-        parts.append(f"[Skill directory: {skill_dir}]")
-        parts.append(
-            "Resolve any relative paths in this skill (e.g. `scripts/foo.js`, "
-            "`templates/config.yaml`) against that directory, then run them "
-            "with the terminal tool using the absolute path."
-        )
+        if pinned_snapshot_verified:
+            parts.append("[This skill was loaded from a dispatcher-verified snapshot.]")
+            parts.append(
+                "Load supporting files only through skill_view. Do not read or "
+                "execute files directly from the live skill directory."
+            )
+        else:
+            parts.append(f"[Skill directory: {skill_dir}]")
+            parts.append(
+                "Resolve any relative paths in this skill (e.g. `scripts/foo.js`, "
+                "`templates/config.yaml`) against that directory, then run them "
+                "with the terminal tool using the absolute path."
+            )
 
     # ── Inject resolved skill config values ──
     _inject_skill_config(loaded_skill, parts)
@@ -353,12 +364,21 @@ def _build_skill_message(
         parts.append("")
         parts.append("[This skill has supporting files:]")
         for sf in supporting:
-            parts.append(f"- {sf}  ->  {skill_dir / sf}")
-        parts.append(
-            f'\nLoad any of these with skill_view(name="{skill_view_target}", '
-            f'file_path="<path>"), or run scripts directly by absolute path '
-            f"(e.g. `node {skill_dir}/scripts/foo.js`)."
-        )
+            if pinned_snapshot_verified:
+                parts.append(f"- {sf}")
+            else:
+                parts.append(f"- {sf}  ->  {skill_dir / sf}")
+        if pinned_snapshot_verified:
+            parts.append(
+                f'\nLoad these only with skill_view(name="{skill_view_target}", '
+                'file_path="<path>").'
+            )
+        else:
+            parts.append(
+                f'\nLoad any of these with skill_view(name="{skill_view_target}", '
+                f'file_path="<path>"), or run scripts directly by absolute path '
+                f"(e.g. `node {skill_dir}/scripts/foo.js`)."
+            )
 
     if user_instruction:
         parts.append("")

@@ -1642,12 +1642,21 @@ def skill_view(
         rendered_content = content
         if preprocess:
             try:
-                from agent.skill_preprocessing import preprocess_skill_content
+                from agent.skill_preprocessing import (
+                    load_skills_config,
+                    preprocess_skill_content,
+                )
+
+                preprocessing_config = None
+                if pinned_snapshot is not None:
+                    preprocessing_config = dict(load_skills_config())
+                    preprocessing_config["inline_shell"] = False
 
                 rendered_content = preprocess_skill_content(
                     content,
                     skill_dir,
                     session_id=task_id,
+                    skills_cfg=preprocessing_config,
                 )
             except Exception:
                 logger.debug(
@@ -1678,6 +1687,8 @@ def skill_view(
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
+        if pinned_snapshot is not None:
+            result["_pinned_snapshot_verified"] = True
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:
