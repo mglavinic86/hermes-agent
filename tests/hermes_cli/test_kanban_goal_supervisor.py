@@ -1809,6 +1809,18 @@ def test_pinned_reviewer_disables_inline_shell_after_snapshot_verification(
         monkeypatch.setenv(key, value)
 
     shell_calls: list[str] = []
+    discovery_calls: list[str] = []
+    original_glob = Path.glob
+
+    def live_glob(path, pattern):
+        if path == _skill_dir / "references":
+            discovery_calls.append(pattern)
+            return iter(
+                [_skill_dir / "references" / "MUTATED_UNCHECKED_FILENAME.md"]
+            )
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", live_glob)
     monkeypatch.setattr(
         skill_commands,
         "_load_skills_config",
@@ -1840,6 +1852,8 @@ def test_pinned_reviewer_disables_inline_shell_after_snapshot_verification(
     assert "Verified literal: !`cat SKILL.md`" in prompt
     assert "Verified directory token: ${HERMES_SKILL_DIR}" in prompt
     assert "MUTATED_UNCHECKED_BODY" not in prompt
+    assert "MUTATED_UNCHECKED_FILENAME" not in prompt
+    assert "references/rules.md" in prompt
     assert "dispatcher-verified snapshot" in prompt
     assert str(_skill_dir) not in prompt
     assert "run scripts directly" not in prompt
@@ -1850,6 +1864,7 @@ def test_pinned_reviewer_disables_inline_shell_after_snapshot_verification(
     assert "Verified directory token: ${HERMES_SKILL_DIR}" in viewed["content"]
     assert "MUTATED_UNCHECKED_BODY" not in viewed["content"]
     assert shell_calls == []
+    assert discovery_calls == []
 
 
 def test_durable_review_without_pinned_digest_never_spawns(

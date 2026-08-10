@@ -1503,7 +1503,32 @@ def skill_view(
         asset_files = []
         script_files = []
 
-        if skill_dir:
+        if pinned_snapshot is not None:
+            for rel in sorted(pinned_snapshot):
+                candidate = PurePosixPath(rel)
+                parts = candidate.parts
+                suffix = candidate.suffix.lower()
+                if len(parts) == 2 and parts[0] == "references" and suffix == ".md":
+                    reference_files.append(rel)
+                elif parts and parts[0] == "templates" and suffix in {
+                    ".md",
+                    ".py",
+                    ".yaml",
+                    ".yml",
+                    ".json",
+                    ".tex",
+                    ".sh",
+                }:
+                    template_files.append(rel)
+                elif parts and parts[0] == "assets":
+                    asset_files.append(rel)
+                elif (
+                    len(parts) == 2
+                    and parts[0] == "scripts"
+                    and suffix in {".py", ".sh", ".bash", ".js", ".ts", ".rb"}
+                ):
+                    script_files.append(rel)
+        elif skill_dir:
             references_dir = skill_dir / "references"
             if references_dir.exists():
                 reference_files = [
