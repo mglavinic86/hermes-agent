@@ -404,7 +404,6 @@ def test_build_gave_up_reserves_one_repair_and_replay_creates_no_duplicate(
         ("dependency_wait", "dependency"),
         ("block_loop_detected", "needs_input"),
         ("scheduled", None),
-        ("archived", None),
         ("status:triage", None),
     ],
 )
@@ -436,9 +435,6 @@ def test_current_run_park_or_block_terminates_goal_and_notifies_once(
                 reason="wait for owner window",
                 expected_run_id=task.current_run_id,
             )
-        elif terminal_event == "archived":
-            assert kb.archive_task(conn, task.id)
-            assert not kb.delete_archived_task(conn, task.id)
         elif terminal_event == "status:triage":
             from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
@@ -482,6 +478,54 @@ def test_current_run_park_or_block_terminates_goal_and_notifies_once(
     assert len(bindings) == 1 and bindings[0].completion_event_id is not None
     assert [item.kind for item in notifications] == ["BLOCKED"]
     assert notifications[0].payload["event"] == terminal_event
+
+
+def test_newer_runless_status_event_does_not_mask_run_closing_event(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import profiles
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    with kb.connect() as conn:
+        created = create_durable_goal(
+            conn,
+            objective="Preserve the run-closing terminal proof",
+            origin=GoalOrigin(platform="telegram", chat_id="owner-chat"),
+            board="default",
+            builder_profile="builder",
+            verifier_profile="verifier",
+            reviewer_profile="reviewer",
+            repair_budget=1,
+            review_retry_budget=1,
+        )
+        task = kb.claim_task(conn, created.task_id, claimer="builder")
+        assert task is not None and task.current_run_id is not None
+        assert _set_status_direct(conn, task.id, "todo")
+        assert _set_status_direct(conn, task.id, "triage")
+        assert not kb.archive_task(conn, task.id)
+
+        first = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert first.action == "BLOCKED"
+    assert replay.action == "NOOP"
+    assert goal is not None and goal.status == "BLOCKED"
+    assert "status:triage" in (goal.blocked_reason or "")
+    assert [item.kind for item in notifications] == ["BLOCKED"]
+    assert notifications[0].payload["event"] == "status:triage"
 
 
 def test_dispatcher_scoped_worker_cannot_archive_own_or_foreign_task(
@@ -528,6 +572,9 @@ def test_dispatcher_scoped_worker_cannot_archive_own_or_foreign_task(
         )
         == 1
     )
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    assert _cmd_archive(Namespace(task_ids=[own.task_id], purge_ids=[])) == 1
 
     with kb.connect() as conn:
         own_after = kb.get_task(conn, own.task_id)

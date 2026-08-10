@@ -450,32 +450,33 @@ def _current_binding(conn, goal: DurableGoal) -> Optional[DurableGoalTask]:
 
 def _validated_terminal_event(conn, binding: DurableGoalTask):
     """Return the newest terminal event only when its run is exact/current."""
-    row = conn.execute(
+    rows = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? "
         "AND kind IN ('completed', 'gave_up', 'blocked', 'dependency_wait', "
         "'block_loop_detected', 'scheduled', 'archived', 'status') "
-        "ORDER BY id DESC LIMIT 1",
+        "ORDER BY id DESC",
         (binding.task_id,),
-    ).fetchone()
-    if row is None or row["run_id"] is None:
-        return None
-    try:
-        run_id = int(row["run_id"])
-    except (TypeError, ValueError):
-        return None
-    if run_id < 1:
-        return None
-    run = kb.get_run(conn, run_id)
+    ).fetchall()
     latest = kb.latest_run(conn, binding.task_id)
-    if (
-        run is None
-        or latest is None
-        or run.task_id != binding.task_id
-        or latest.id != run_id
-        or run.ended_at is None
-    ):
+    if latest is None or latest.ended_at is None:
         return None
-    return row
+    for row in rows:
+        if row["run_id"] is None:
+            continue
+        try:
+            run_id = int(row["run_id"])
+        except (TypeError, ValueError):
+            continue
+        if run_id < 1 or latest.id != run_id:
+            continue
+        run = kb.get_run(conn, run_id)
+        if (
+            run is not None
+            and run.task_id == binding.task_id
+            and run.ended_at is not None
+        ):
+            return row
+    return None
 
 
 def _structured_completion_payload(
@@ -598,7 +599,12 @@ def supervise_goal_once(
         event_reason = str(event_payload.get("reason") or "").strip()
         event_label = str(event["kind"])
         if event_label == "status":
-            direct_status = str(event_payload.get("status") or "unknown").strip()
+            current_task = kb.get_task(conn, binding.task_id)
+            direct_status = str(
+                (current_task.status if current_task is not None else None)
+                or event_payload.get("status")
+                or "unknown"
+            ).strip()
             event_label = f"status:{direct_status}"
         reason = f"durable task {event_label} during {binding.stage}"
         if event_reason:

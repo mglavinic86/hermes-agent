@@ -7411,6 +7411,14 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        active_goal = conn.execute(
+            "SELECT 1 FROM kanban_goal_tasks gt "
+            "JOIN kanban_goals g ON g.id = gt.goal_id "
+            "WHERE gt.task_id = ? AND g.status = 'ACTIVE' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if active_goal is not None:
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
