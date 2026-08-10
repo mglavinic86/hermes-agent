@@ -167,10 +167,13 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return tid
 
 
@@ -699,10 +702,13 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     # No judge reachable. judge_goal must not even be consulted; if it were,
     # this stub would reject — so reaching "done" proves the probe short-circuit.
@@ -764,10 +770,13 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             conn, title="goal-mode-block-test", assignee="test-worker",
             body="Must achieve X.", goal_mode=True,
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return goal_task_id
 
 
@@ -2006,6 +2015,33 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     assert d.get("ok") is True
 
 
+@pytest.mark.parametrize("raw_run_id", [None, "malformed", "0", "-1"])
+def test_worker_complete_rejects_missing_or_invalid_run_identity(
+    worker_env, monkeypatch, raw_run_id
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        before = kb.get_task(conn, worker_env)
+        assert before is not None and before.current_run_id is not None
+        current_run_id = before.current_run_id
+
+    if raw_run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", raw_run_id)
+
+    out = kt._handle_complete({"summary": "must not bypass the active run"})
+    assert json.loads(out).get("ok") is not True
+
+    with kb.connect() as conn:
+        after = kb.get_task(conn, worker_env)
+    assert after is not None
+    assert after.status == "running"
+    assert after.current_run_id == current_run_id
+
+
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     """Orchestrator profiles (no HERMES_KANBAN_TASK) can still complete
     any task via explicit task_id. The check only applies to workers."""
@@ -2280,8 +2316,11 @@ def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
     # Seed the alt board with a claimed task.
     with kb.connect(board="alt") as conn:
         tid = kb.create_task(conn, title="alt hb", assignee="alt-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     from tools import kanban_tools as kt
     out = kt._handle_heartbeat({"note": "alive on alt", "board": "alt"})

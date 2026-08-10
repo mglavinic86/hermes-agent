@@ -2128,15 +2128,19 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    scoped_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not scoped_task_id:
         return None
+    if scoped_task_id != task_id:
+        return 0
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
-        return None
+        return 0
     try:
-        return int(raw)
+        parsed = int(raw)
     except ValueError:
-        return None
+        return 0
+    return parsed if parsed > 0 else 0
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:

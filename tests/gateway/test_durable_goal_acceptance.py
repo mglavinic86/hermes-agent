@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -58,6 +60,30 @@ def _init_checkout(path: Path) -> None:
     )
 
 
+def _run_real_gateway_tick(home: Path) -> dict:
+    helper = Path(__file__).with_name("durable_goal_gateway_process.py")
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(home)
+    env.pop("HERMES_KANBAN_BOARD", None)
+    env.pop("HERMES_KANBAN_DISPATCH_IN_GATEWAY", None)
+    repo_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (repo_root, env.get("PYTHONPATH", "")) if part
+    )
+    completed = subprocess.run(
+        [sys.executable, str(helper), "watch-once"],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    assert lines, completed.stderr
+    return json.loads(lines[-1])
+
+
 @pytest.mark.asyncio
 async def test_one_route_survives_stage_restarts_and_notifies_owner_once(
     tmp_path,
@@ -70,6 +96,9 @@ async def test_one_route_survives_stage_restarts_and_notifies_owner_once(
     (home / "config.yaml").write_text(
         """
 kanban:
+  dispatch_in_gateway: true
+  dispatch_interval_seconds: 1
+  auto_decompose: false
   durable_goals:
     board: default
     builder_profile: builder
@@ -236,26 +265,17 @@ kanban:
             expected_run_id=review.current_run_id,
         )
 
-    # Restart after REVIEW completion but before READY transition/delivery.
+    # Crash/restart after REVIEW completion but before READY transition/delivery.
+    first_gateway = _run_real_gateway_tick(home)
+    second_gateway = _run_real_gateway_tick(home)
+    assert first_gateway["runtime_id"].startswith(f"{first_gateway['pid']}:")
+    assert second_gateway["runtime_id"].startswith(f"{second_gateway['pid']}:")
+    assert second_gateway["runtime_id"] != first_gateway["runtime_id"]
     with kb.connect() as conn:
-        ready = supervise_goal_once(
-            conn,
-            goal_id,
-            board="default",
-            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
-        )
-        replay = supervise_goal_once(
-            conn,
-            goal_id,
-            board="default",
-            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
-        )
         goal = get_durable_goal(conn, goal_id)
         bindings = list_durable_goal_tasks(conn, goal_id)
         notifications = list_goal_notifications(conn, goal_id)
 
-    assert ready.action == "READY_FOR_OWNER"
-    assert replay.action == "NOOP"
     assert goal is not None and goal.status == "READY_FOR_OWNER"
     assert [binding.stage for binding in bindings] == [
         "BUILD",

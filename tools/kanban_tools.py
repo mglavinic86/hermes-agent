@@ -222,16 +222,20 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
 
 
 def _worker_run_id(task_id: str) -> Optional[int]:
-    """Return this worker's dispatcher run id when it is scoped to task_id."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    """Return the scoped worker's positive run id, or a fail-closed sentinel."""
+    scoped_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not scoped_task_id:
         return None
+    if scoped_task_id != task_id:
+        return 0
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
-        return None
+        return 0
     try:
-        return int(raw)
+        parsed = int(raw)
     except ValueError:
-        return None
+        return 0
+    return parsed if parsed > 0 else 0
 
 
 def _stamp_worker_session_metadata(
