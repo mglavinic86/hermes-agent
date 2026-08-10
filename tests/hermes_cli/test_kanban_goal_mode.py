@@ -209,6 +209,56 @@ def test_cli_reserves_first_turn_before_model_and_blocks_at_limit(
         assert task.status == "blocked"
 
 
+@pytest.mark.parametrize("run_id_env", [None, "not-an-int", "0", "-1"])
+def test_cli_goal_reservation_requires_current_positive_run_identity(
+    kanban_home, monkeypatch, run_id_env
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="identity guarded",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=3,
+        )
+        stale = kb.claim_task(conn, tid)
+        assert stale is not None
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL "
+            "WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        current = kb.claim_task(conn, tid)
+        assert current is not None
+        assert current.current_run_id != stale.current_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    if run_id_env is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id_env)
+
+    assert cli_module._reserve_kanban_goal_first_turn_q() is False
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == current.current_run_id
+        assert task.goal_turns_used == 0
+        assert kb.reserve_goal_turn(
+            conn,
+            tid,
+            max_turns=3,
+            expected_run_id=None,
+        ) is None
+        persisted = kb.get_task(conn, tid)
+        assert persisted is not None
+        assert persisted.goal_turns_used == 0
+
+
 def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
     """A tasks table created without goal columns must gain them on init."""
     home = tmp_path / ".hermes"

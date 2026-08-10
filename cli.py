@@ -15481,9 +15481,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 def _kanban_goal_run_id_from_env() -> "int | None":
     raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
     try:
-        return int(raw) if raw else None
+        run_id = int(raw) if raw else None
     except ValueError:
         return None
+    return run_id if run_id is not None and run_id > 0 else None
 
 
 def _reserve_kanban_goal_first_turn_q() -> bool:
@@ -15496,6 +15497,11 @@ def _reserve_kanban_goal_first_turn_q() -> bool:
     from hermes_cli.goals import DEFAULT_MAX_TURNS as _DEF_TURNS
 
     expected_run_id = _kanban_goal_run_id_from_env()
+    if expected_run_id is None:
+        logger.error(
+            "kanban goal turn reservation refused: missing or invalid run identity"
+        )
+        return False
     conn = _kb.connect()
     try:
         task = _kb.get_task(conn, task_id)
@@ -15567,6 +15573,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
     expected_run_id = _kanban_goal_run_id_from_env()
+    if expected_run_id is None:
+        logger.error(
+            "kanban goal loop refused: missing or invalid run identity"
+        )
+        return
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(

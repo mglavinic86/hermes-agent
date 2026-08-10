@@ -3800,8 +3800,9 @@ def reserve_goal_turn(
     The counter lives on the task rather than the run, so a worker crash,
     reclaim, or process restart cannot reset the budget. Reservation happens
     before each model turn; a crash after reservation may conservatively spend
-    one turn, but can never overspend the declared cap. ``expected_run_id``
-    prevents a stale/reclaimed worker from consuming its successor's budget.
+    one turn, but can never overspend the declared cap. A positive
+    ``expected_run_id`` is mandatory so a stale/reclaimed worker cannot consume
+    its successor's budget by omitting or corrupting its run identity.
 
     Returns the new cumulative count, or ``None`` when the budget is exhausted,
     the task/run is stale, or the card is not an active goal-mode task.
@@ -3813,18 +3814,21 @@ def reserve_goal_turn(
     if limit < 1:
         return None
 
-    where_run = ""
-    params: list[Any] = [task_id, limit]
-    if expected_run_id is not None:
-        where_run = " AND current_run_id = ?"
-        params.append(int(expected_run_id))
+    try:
+        run_id = int(expected_run_id) if expected_run_id is not None else None
+    except (TypeError, ValueError):
+        return None
+    if run_id is None or run_id < 1:
+        return None
+
+    params: list[Any] = [task_id, limit, run_id]
 
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks "
             "SET goal_turns_used = goal_turns_used + 1 "
             "WHERE id = ? AND goal_mode = 1 AND status = 'running' "
-            "AND goal_turns_used < ?" + where_run,
+            "AND goal_turns_used < ? AND current_run_id = ?",
             tuple(params),
         )
         if cur.rowcount != 1:
