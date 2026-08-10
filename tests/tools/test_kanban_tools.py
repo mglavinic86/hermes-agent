@@ -936,6 +936,136 @@ def test_heartbeat_extends_claim_expires(worker_env):
     )
 
 
+@pytest.mark.parametrize("entrypoint", ["tool", "auto"])
+@pytest.mark.parametrize(
+    "run_identity",
+    [None, "malformed", "0", "-1", "stale-positive"],
+)
+def test_scoped_heartbeat_invalid_run_identity_has_no_side_effects(
+    worker_env, monkeypatch, entrypoint, run_identity
+):
+    """A scoped worker must prove its exact positive run before any write."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.current_run_id is not None
+        current_run_id = task.current_run_id
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (101, 102, worker_env),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (201, 202, current_run_id),
+        )
+        conn.commit()
+
+        def snapshot():
+            task_row = tuple(
+                conn.execute(
+                    "SELECT status, current_run_id, claim_lock, claim_expires, "
+                    "last_heartbeat_at FROM tasks WHERE id = ?",
+                    (worker_env,),
+                ).fetchone()
+            )
+            run_row = tuple(
+                conn.execute(
+                    "SELECT id, task_id, claim_expires, last_heartbeat_at, ended_at "
+                    "FROM task_runs WHERE id = ?",
+                    (current_run_id,),
+                ).fetchone()
+            )
+            events = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT id, kind, payload, run_id FROM task_events "
+                    "WHERE task_id = ? ORDER BY id",
+                    (worker_env,),
+                )
+            ]
+            return task_row, run_row, events
+
+        before = snapshot()
+
+    if run_identity is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    elif run_identity == "stale-positive":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current_run_id + 999))
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_identity)
+
+    if entrypoint == "tool":
+        result = json.loads(kt._handle_heartbeat({"note": "must not land"}))
+        assert result.get("ok") is not True
+    else:
+        monkeypatch.setattr(kt, "_auto_heartbeat_last_attempt", 0.0)
+        assert kt.heartbeat_current_worker_from_env() is False
+
+    with kb.connect() as conn:
+        task_row = tuple(
+            conn.execute(
+                "SELECT status, current_run_id, claim_lock, claim_expires, "
+                "last_heartbeat_at FROM tasks WHERE id = ?",
+                (worker_env,),
+            ).fetchone()
+        )
+        run_row = tuple(
+            conn.execute(
+                "SELECT id, task_id, claim_expires, last_heartbeat_at, ended_at "
+                "FROM task_runs WHERE id = ?",
+                (current_run_id,),
+            ).fetchone()
+        )
+        events = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT id, kind, payload, run_id FROM task_events "
+                "WHERE task_id = ? ORDER BY id",
+                (worker_env,),
+            )
+        ]
+    assert (task_row, run_row, events) == before
+
+
+def test_explicit_unscoped_heartbeat_keeps_legacy_claim_extension(
+    worker_env, monkeypatch
+):
+    """Non-worker callers may still heartbeat an explicit task without a run token."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        conn.execute(
+            "UPDATE tasks SET claim_expires = 1, last_heartbeat_at = NULL WHERE id = ?",
+            (worker_env,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = 1, last_heartbeat_at = NULL WHERE id = ?",
+            (run_id,),
+        )
+        conn.commit()
+
+    result = json.loads(kt._handle_heartbeat({"task_id": worker_env}))
+    assert result["ok"] is True
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        run = kb.get_run(conn, run_id)
+        events = [event.kind for event in kb.list_events(conn, worker_env)]
+    assert task.claim_expires > 1
+    assert task.last_heartbeat_at is not None
+    assert run.claim_expires == task.claim_expires
+    assert run.last_heartbeat_at == task.last_heartbeat_at
+    assert events[-1] == "heartbeat"
+
+
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({

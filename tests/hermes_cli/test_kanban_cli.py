@@ -180,6 +180,75 @@ def test_scoped_worker_complete_rejects_foreign_task(kanban_home, monkeypatch):
     assert task.current_run_id == foreign_run.current_run_id
 
 
+@pytest.mark.parametrize("command", ["block", "schedule"])
+@pytest.mark.parametrize("identity", ["missing", "stale", "foreign"])
+def test_scoped_lifecycle_failure_cannot_inject_reason_comment(
+    kanban_home, monkeypatch, command, identity
+):
+    """Run-bound block/schedule failures leave comments, events, and state intact."""
+    with kb.connect() as conn:
+        target = kb.create_task(conn, title="protected", assignee="worker")
+        first = kb.claim_task(conn, target, claimer="worker")
+        assert first is not None and first.current_run_id is not None
+        env_task_id = target
+        env_run_id = first.current_run_id
+
+        if identity == "stale":
+            assert kb.block_task(
+                conn,
+                target,
+                reason="prepare retry",
+                expected_run_id=first.current_run_id,
+            )
+            assert kb.unblock_task(conn, target)
+            current = kb.claim_task(conn, target, claimer="worker")
+            assert current is not None and current.current_run_id != env_run_id
+        elif identity == "foreign":
+            own = kb.create_task(conn, title="own", assignee="worker")
+            own_run = kb.claim_task(conn, own, claimer="worker")
+            assert own_run is not None and own_run.current_run_id is not None
+            env_task_id = own
+            env_run_id = own_run.current_run_id
+
+        before_status = kb.get_task(conn, target).status
+        before_comments = [tuple(row) for row in conn.execute(
+            "SELECT id, author, body, created_at FROM task_comments "
+            "WHERE task_id = ? ORDER BY id",
+            (target,),
+        )]
+        before_events = [tuple(row) for row in conn.execute(
+            "SELECT id, kind, payload, run_id FROM task_events "
+            "WHERE task_id = ? ORDER BY id",
+            (target,),
+        )]
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", env_task_id)
+    if identity == "missing":
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(env_run_id))
+
+    output = kc.run_slash(f"{command} {target} untrusted reason")
+    assert f"cannot {command}" in output.lower()
+
+    with kb.connect() as conn:
+        after_status = kb.get_task(conn, target).status
+        after_comments = [tuple(row) for row in conn.execute(
+            "SELECT id, author, body, created_at FROM task_comments "
+            "WHERE task_id = ? ORDER BY id",
+            (target,),
+        )]
+        after_events = [tuple(row) for row in conn.execute(
+            "SELECT id, kind, payload, run_id FROM task_events "
+            "WHERE task_id = ? ORDER BY id",
+            (target,),
+        )]
+
+    assert after_status == before_status == "running"
+    assert after_comments == before_comments
+    assert after_events == before_events
+
+
 def test_run_slash_show_includes_comments(kanban_home):
     out = kc.run_slash("create 'x'")
     import re

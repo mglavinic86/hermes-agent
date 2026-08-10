@@ -5896,17 +5896,33 @@ def complete_task(
     """
     now = int(time.time())
 
-    # Gate: verify created_cards BEFORE the main write txn. A rejected
-    # completion still needs an auditable event, so we emit it in a
-    # tiny dedicated txn, then raise. The caller is responsible for
-    # surfacing HallucinatedCardsError to the worker; this function
-    # never mutates task state on a phantom-card rejection.
+    # Gate: a registered worker must prove its exact active run inside the
+    # same write transaction that records a phantom-card rejection. This keeps
+    # a stale worker from leaving audit artifacts on its successor while
+    # preserving the auditable legacy behavior for unscoped callers.
     if created_cards:
-        verified_cards, phantom_cards = _verify_created_cards(
-            conn, task_id, created_cards
-        )
-        if phantom_cards:
-            with write_txn(conn):
+        phantom_error: Optional[HallucinatedCardsError] = None
+        with write_txn(conn):
+            if expected_run_id is not None:
+                try:
+                    guarded_run_id = int(expected_run_id)
+                except (TypeError, ValueError):
+                    return False
+                if guarded_run_id < 1:
+                    return False
+                active = conn.execute(
+                    "SELECT 1 FROM tasks WHERE id = ? "
+                    "AND status IN ('running', 'ready', 'blocked') "
+                    "AND current_run_id = ?",
+                    (task_id, guarded_run_id),
+                ).fetchone()
+                if active is None:
+                    return False
+
+            verified_cards, phantom_cards = _verify_created_cards(
+                conn, task_id, created_cards
+            )
+            if phantom_cards:
                 _append_event(
                     conn, task_id, "completion_blocked_hallucination",
                     {
@@ -5918,8 +5934,15 @@ def complete_task(
                             else None
                         ),
                     },
+                    run_id=(
+                        guarded_run_id
+                        if expected_run_id is not None
+                        else None
+                    ),
                 )
-            raise HallucinatedCardsError(phantom_cards, task_id)
+                phantom_error = HallucinatedCardsError(phantom_cards, task_id)
+        if phantom_error is not None:
+            raise phantom_error
     else:
         verified_cards = []
 
@@ -8177,20 +8200,67 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    extend_claim: bool = False,
+    claimer: Optional[str] = None,
+    ttl_seconds: Optional[int] = None,
 ) -> bool:
-    """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+    """Atomically record liveness and optionally extend the active claim.
 
     Called by long-running workers as a liveness signal orthogonal to
     the PID check. A worker that forks a long-lived child (train loop,
     video encode, web crawl) can have its Python still alive while the
     actual work process is stuck; periodic heartbeats catch that.
 
-    Returns True on success, False if the task is not in a state that
-    should be heartbeating (not running, or claim expired).
+    When ``extend_claim`` is true, the task status, current run, and claim lock
+    are validated together before the task/run heartbeat timestamps, task/run
+    claim expiries, and audit event are written in the same transaction.
+
+    Returns True on success, False if the task is not in a state that should
+    be heartbeating or any supplied run/claim identity is stale.
     """
+    run_id: Optional[int] = None
+    if expected_run_id is not None:
+        try:
+            run_id = int(expected_run_id)
+        except (TypeError, ValueError):
+            return False
+        if run_id < 1:
+            return False
+
     now = int(time.time())
+    expires = (
+        now + _resolve_claim_ttl_seconds(ttl_seconds)
+        if extend_claim
+        else None
+    )
+    lock = (claimer or _claimer_id()) if extend_claim else None
     with write_txn(conn):
-        if expected_run_id is None:
+        if extend_claim:
+            params: list[Any] = [task_id, lock]
+            sql = (
+                "SELECT t.current_run_id FROM tasks t "
+                "JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+                "WHERE t.id = ? AND t.status = 'running' AND t.claim_lock = ?"
+            )
+            if run_id is not None:
+                sql += " AND t.current_run_id = ?"
+                params.append(run_id)
+            row = conn.execute(sql, params).fetchone()
+            if row is None or row["current_run_id"] is None:
+                return False
+            active_run_id = int(row["current_run_id"])
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ?, claim_expires = ? "
+                "WHERE id = ?",
+                (now, expires, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ?, claim_expires = ? "
+                "WHERE id = ? AND task_id = ?",
+                (now, expires, active_run_id, task_id),
+            )
+            run_id = active_run_id
+        elif run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
                 "WHERE id = ? AND status = 'running'",
@@ -8200,20 +8270,18 @@ def heartbeat_worker(
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
                 "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
+                (now, task_id, run_id),
             )
-        if cur.rowcount != 1:
-            return False
-        run_id = (
-            int(expected_run_id)
-            if expected_run_id is not None
-            else _current_run_id(conn, task_id)
-        )
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
-                (now, run_id),
-            )
+        if not extend_claim:
+            if cur.rowcount != 1:
+                return False
+            if run_id is None:
+                run_id = _current_run_id(conn, task_id)
+            if run_id is not None:
+                conn.execute(
+                    "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
+                    (now, run_id),
+                )
         _append_event(
             conn, task_id, "heartbeat",
             {"note": note} if note else None,
@@ -10066,6 +10134,36 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    from agent.skill_integrity import PINNED_SKILL_DIGESTS_ENV
+
+    # This bridge is dispatcher-owned. Never let an inherited/session value
+    # pin arbitrary skills in an ordinary worker.
+    env.pop(PINNED_SKILL_DIGESTS_ENV, None)
+    if "immutable-change-reviews" in (task.skills or []):
+        try:
+            with connect_closing(board=board) as digest_conn:
+                digest_row = digest_conn.execute(
+                    "SELECT g.reviewer_skill_digest "
+                    "FROM kanban_goal_tasks gt "
+                    "JOIN kanban_goals g ON g.id = gt.goal_id "
+                    "WHERE gt.task_id = ? AND gt.stage LIKE 'REVIEW%'",
+                    (task.id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise RuntimeError(
+                f"cannot resolve pinned reviewer digest for {task.id}"
+            ) from exc
+        if digest_row is not None:
+            pinned_digest = str(digest_row["reviewer_skill_digest"] or "").strip()
+            if not re.fullmatch(r"[0-9a-f]{64}", pinned_digest):
+                raise RuntimeError(
+                    f"durable review task {task.id} has no valid pinned skill digest"
+                )
+            env[PINNED_SKILL_DIGESTS_ENV] = json.dumps(
+                {"immutable-change-reviews": pinned_digest},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
     # session binds ContextVars in this process.

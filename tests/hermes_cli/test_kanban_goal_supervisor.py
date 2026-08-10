@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -205,6 +207,49 @@ def _create_reviewer_snapshot(home: Path) -> Path:
         encoding="utf-8",
     )
     return skill_dir
+
+
+def _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch):
+    """Run the real durable dispatcher/default-spawn path up to child exec."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    skill_dir = _create_reviewer_snapshot(kanban_home)
+    expected_digest = _profile_skill_digest("reviewer", "immutable-change-reviews")
+    assert expected_digest is not None
+    captured: dict = {}
+
+    class _FakeProc:
+        pid = 24680
+
+    def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return _FakeProc()
+
+    def _spawn(task, workspace, **kwargs):
+        # Let dispatcher worktree setup use the real subprocess machinery;
+        # intercept only the final child exec inside the production spawner.
+        with patch("subprocess.Popen", _fake_popen):
+            return kb._default_spawn(task, workspace, board=kwargs.get("board"))
+
+    with kb.connect() as conn:
+        _created, review_id = _create_goal_at_review(
+            conn,
+            candidate_sha="e" * 40,
+            reviewer_skill_digest=expected_digest,
+        )
+        result = kb.dispatch_once(
+            conn,
+            board="default",
+            spawn_fn=_spawn,
+            durable_goal_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+
+    assert result.spawned and result.spawned[0][0] == review_id
+    assert captured["env"]["HERMES_HOME"].endswith("/profiles/reviewer")
+    assert "--skills" in captured["cmd"]
+    return skill_dir, expected_digest, captured["env"]
 
 
 def _create_legacy_ready_task(conn, *, title: str, assignee: str) -> str:
@@ -1524,6 +1569,91 @@ def test_pinned_reviewer_skill_digest_hardlink_fails_closed(
     assert runs == []
     assert goal is not None and goal.status == "BLOCKED_CAPABILITY"
     assert [item.kind for item in notifications] == ["BLOCKED_CAPABILITY"]
+
+
+def test_pinned_reviewer_skill_mutation_after_preflight_fails_child_preload(
+    kanban_home, monkeypatch
+):
+    """The spawned reviewer revalidates the parent-pinned tree, not just its name."""
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from agent.skill_integrity import PINNED_SKILL_DIGESTS_ENV
+
+    skill_dir, expected_digest, child_env = (
+        _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch)
+    )
+    (skill_dir / "references" / "rules.md").write_text(
+        "mutated after dispatcher preflight\n",
+        encoding="utf-8",
+    )
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+
+    prompt, loaded, missing = build_preloaded_skills_prompt(
+        ["immutable-change-reviews"]
+    )
+
+    assert json.loads(child_env[PINNED_SKILL_DIGESTS_ENV]) == {
+        "immutable-change-reviews": expected_digest,
+    }
+    assert prompt == ""
+    assert loaded == []
+    assert missing == ["immutable-change-reviews"]
+
+
+def test_pinned_reviewer_skill_mutation_after_preload_fails_linked_read(
+    kanban_home, monkeypatch
+):
+    """Every later linked-file read revalidates the full pinned skill tree."""
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from tools.skills_tool import skill_view
+
+    skill_dir, _expected_digest, child_env = (
+        _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch)
+    )
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+
+    prompt, loaded, missing = build_preloaded_skills_prompt(
+        ["immutable-change-reviews"]
+    )
+    assert prompt, json.loads(skill_view("immutable-change-reviews"))
+    assert loaded == ["immutable-change-reviews"]
+    assert missing == []
+
+    (skill_dir / "references" / "rules.md").write_text(
+        "mutated after child preload\n",
+        encoding="utf-8",
+    )
+    linked = json.loads(
+        skill_view(
+            "immutable-change-reviews",
+            file_path="references/rules.md",
+        )
+    )
+
+    assert linked["success"] is False
+    assert "digest" in linked["error"].lower()
+
+
+def test_durable_review_without_pinned_digest_never_spawns(
+    kanban_home, monkeypatch
+):
+    """A durable REVIEW binding cannot silently degrade to an unpinned child."""
+    with kb.connect() as conn:
+        _created, review_id = _create_goal_at_review(
+            conn,
+            candidate_sha="e" * 40,
+            reviewer_skill_digest=None,
+        )
+        review = kb.get_task(conn, review_id)
+    assert review is not None
+
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("unpinned reviewer spawned"),
+    )
+    with pytest.raises(RuntimeError, match="no valid pinned skill digest"):
+        kb._default_spawn(review, str(kanban_home.parent / "repo"), board="default")
 
 
 def test_durable_dispatch_foreign_board_fails_closed_but_legacy_task_spawns(

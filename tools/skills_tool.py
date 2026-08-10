@@ -84,6 +84,10 @@ from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
 )
+from agent.skill_integrity import (
+    pinned_skill_digests_from_env,
+    verify_pinned_skill_tree,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +205,20 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
     if has_traversal_component(candidate):
         return "Skill name cannot contain '..' path traversal components."
     return None
+
+
+def _pinned_skill_integrity_error(
+    name: str,
+    skill_dir: Path | None,
+    skills_root: Path,
+) -> str | None:
+    """Return a fail-closed error for a changed dispatcher-pinned skill."""
+    verified, error = verify_pinned_skill_tree(
+        name,
+        skill_dir,
+        skills_root=skills_root,
+    )
+    return None if verified else (error or "pinned skill digest verification failed")
 
 
 def load_env() -> Dict[str, str]:
@@ -980,6 +998,15 @@ def skill_view(
         JSON string with skill content or error message
     """
     try:
+        pinned_digests = pinned_skill_digests_from_env()
+        if "*" in pinned_digests:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Malformed dispatcher-pinned skill digest map.",
+                },
+                ensure_ascii=False,
+            )
         # Validate before the ':' qualified-name dispatch so a Windows drive
         # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
         # namespace, and so a traversal/absolute name never reaches the
@@ -1034,6 +1061,16 @@ def skill_view(
                                 f"plugin is reloaded."
                             ),
                         },
+                        ensure_ascii=False,
+                    )
+                integrity_error = _pinned_skill_integrity_error(
+                    name,
+                    plugin_skill_md.parent,
+                    _skills_dir(),
+                )
+                if integrity_error:
+                    return json.dumps(
+                        {"success": False, "error": integrity_error},
                         ensure_ascii=False,
                     )
                 return _serve_plugin_skill(
@@ -1218,6 +1255,17 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        integrity_error = _pinned_skill_integrity_error(
+            name,
+            skill_dir,
+            active_skills_dir,
+        )
+        if integrity_error:
+            return json.dumps(
+                {"success": False, "error": integrity_error},
+                ensure_ascii=False,
+            )
+
         # Read the file once — reused for platform check and main content below
         try:
             content = skill_md.read_text(encoding="utf-8")
@@ -1368,6 +1416,16 @@ def skill_view(
                 content = target_file.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
+                integrity_error = _pinned_skill_integrity_error(
+                    name,
+                    skill_dir,
+                    active_skills_dir,
+                )
+                if integrity_error:
+                    return json.dumps(
+                        {"success": False, "error": integrity_error},
+                        ensure_ascii=False,
+                    )
                 return json.dumps(
                     {
                         "success": True,
@@ -1388,6 +1446,17 @@ def skill_view(
                     "Could not record background-review skill read for %s",
                     target_file,
                     exc_info=True,
+                )
+
+            integrity_error = _pinned_skill_integrity_error(
+                name,
+                skill_dir,
+                active_skills_dir,
+            )
+            if integrity_error:
+                return json.dumps(
+                    {"success": False, "error": integrity_error},
+                    ensure_ascii=False,
                 )
 
             return json.dumps(
@@ -1625,6 +1694,17 @@ def skill_view(
             result["compatibility"] = frontmatter["compatibility"]
         if isinstance(metadata, dict):
             result["metadata"] = metadata
+
+        integrity_error = _pinned_skill_integrity_error(
+            name,
+            skill_dir,
+            active_skills_dir,
+        )
+        if integrity_error:
+            return json.dumps(
+                {"success": False, "error": integrity_error},
+                ensure_ascii=False,
+            )
 
         return json.dumps(result, ensure_ascii=False)
 

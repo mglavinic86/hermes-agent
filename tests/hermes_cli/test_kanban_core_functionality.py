@@ -2799,7 +2799,13 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     We intercept Popen to capture the argv without actually spawning a
     hermes subprocess (which would hang trying to call an LLM).
     """
+    from agent.skill_integrity import PINNED_SKILL_DIGESTS_ENV
+
     captured = {}
+    monkeypatch.setenv(
+        PINNED_SKILL_DIGESTS_ENV,
+        '{"must-not-leak":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
+    )
 
     class FakeProc:
         def __init__(self):
@@ -2836,6 +2842,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     env = captured["env"]
     assert env.get("HERMES_KANBAN_TASK") == tid
     assert env.get("HERMES_PROFILE") == "some-profile"
+    assert PINNED_SKILL_DIGESTS_ENV not in env
 
 
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
@@ -3943,6 +3950,91 @@ def test_complete_with_phantom_created_cards_raises_and_audits(kanban_home):
         assert "completed" not in kinds
     finally:
         conn.close()
+
+
+def test_stale_run_phantom_completion_is_rejected_before_any_side_effect(
+    kanban_home,
+):
+    """A stale registered worker cannot audit, publish, or mutate a successor."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="protected completion", assignee="worker")
+        first = kb.claim_task(conn, task_id, claimer="worker")
+        assert first is not None and first.current_run_id is not None
+        stale_run_id = first.current_run_id
+
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "result.txt"
+        artifact.write_text("successor-owned bytes", encoding="utf-8")
+        kb.add_comment(conn, task_id, "owner", "existing comment")
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="retry",
+            expected_run_id=stale_run_id,
+        )
+        assert kb.unblock_task(conn, task_id)
+        current = kb.claim_task(conn, task_id, claimer="worker")
+        assert current is not None and current.current_run_id != stale_run_id
+
+        before_task = tuple(conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone())
+        before_run = tuple(conn.execute(
+            "SELECT * FROM task_runs WHERE id = ?", (current.current_run_id,)
+        ).fetchone())
+        before_comments = [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)
+        )]
+        before_events = [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+        )]
+        before_attachments = [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY id", (task_id,)
+        )]
+        attachment_dir = kb.task_attachments_dir(task_id)
+        before_attachment_files = (
+            sorted(str(path.relative_to(attachment_dir)) for path in attachment_dir.rglob("*"))
+            if attachment_dir.exists()
+            else []
+        )
+
+        result = kb.complete_task(
+            conn,
+            task_id,
+            summary=f"stale completion published {artifact}",
+            metadata={"artifacts": [str(artifact)]},
+            created_cards=["t_deadbeefcafe"],
+            expected_run_id=stale_run_id,
+        )
+
+        assert result is False
+        assert tuple(conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()) == before_task
+        assert tuple(conn.execute(
+            "SELECT * FROM task_runs WHERE id = ?", (current.current_run_id,)
+        ).fetchone()) == before_run
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)
+        )] == before_comments
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+        )] == before_events
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY id", (task_id,)
+        )] == before_attachments
+
+    after_attachment_files = (
+        sorted(str(path.relative_to(attachment_dir)) for path in attachment_dir.rglob("*"))
+        if attachment_dir.exists()
+        else []
+    )
+    assert after_attachment_files == before_attachment_files
+    assert workspace.is_dir()
+    assert artifact.read_text(encoding="utf-8") == "successor-owned bytes"
 
 
 def test_complete_with_cross_worker_card_is_rejected(kanban_home):

@@ -360,18 +360,16 @@ def heartbeat_current_worker_from_env() -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
 
-    Returns True if a write was attempted (whether or not it succeeded);
-    False if the call was skipped (not a kanban worker, rate-limited, or
-    swallowed exception). The boolean is informational — callers should
-    not branch on it.
+    Returns True only when the atomic heartbeat commits; False when skipped,
+    stale, rate-limited, or swallowed as a best-effort failure. The boolean is
+    informational — callers should not branch on it.
 
     Identity comes from:
       * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
       * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
         a stale run that may have already been reclaimed
-      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
-        falls back to the default ``_claimer_id()`` for locally-driven
-        workers that never went through the dispatcher path
+      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for the atomic heartbeat;
+        falls back to the default ``_claimer_id()`` for locally-driven workers
 
     Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
     timestamp (monotonic clock); not thread-safe in the strict sense, but
@@ -380,6 +378,10 @@ def heartbeat_current_worker_from_env() -> bool:
     global _auto_heartbeat_last_attempt
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
+        return False
+    run_id = _worker_run_id(tid)
+    if run_id is None or run_id < 1:
+        logger.debug("auto-heartbeat: missing or invalid positive run identity")
         return False
     import time as _time
     now = _time.monotonic()
@@ -391,25 +393,23 @@ def heartbeat_current_worker_from_env() -> bool:
         try:
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
             try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
-            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-            run_id: Optional[int]
-            try:
-                run_id = int(run_id_raw) if run_id_raw else None
-            except (TypeError, ValueError):
-                run_id = None
-            try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                ok = kb.heartbeat_worker(
+                    conn,
+                    tid,
+                    note=None,
+                    expected_run_id=run_id,
+                    extend_claim=True,
+                    claimer=claim_lock,
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+                return False
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
-        return True
+        return bool(ok)
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
         return False
@@ -915,12 +915,10 @@ def _handle_block(args: dict, **kw) -> str:
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
-    Extends the claim TTL via ``heartbeat_claim`` AND records a heartbeat
-    event via ``heartbeat_worker``. Without the ``heartbeat_claim`` half,
-    a diligent worker that loops this tool while a single tool call
-    blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
-    by ``release_stale_claims`` — which is exactly the trap that
-    ``heartbeat_claim``'s docstring warns against.
+    Atomically validates the worker run + claim lock, extends the task/run
+    claim TTL, touches both heartbeat timestamps, and records the event.
+    Without the claim-extension half, a diligent worker that loops this tool
+    during a long operation can still be reclaimed at the original TTL.
     """
     delegated_err = _reject_delegated_child_mutation("kanban_heartbeat")
     if delegated_err:
@@ -935,22 +933,24 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     board = args.get("board")
+    expected_run_id = _worker_run_id(tid)
+    if os.environ.get("HERMES_KANBAN_TASK") and (
+        expected_run_id is None or expected_run_id < 1
+    ):
+        return tool_error(
+            "kanban_heartbeat: missing or invalid positive worker run identity"
+        )
     try:
         kb, conn = _connect(board=board)
         try:
-            # Extend the claim TTL first. The dispatcher pins
-            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
-            # (see _default_spawn in kanban_db.py); falling back to the
-            # default _claimer_id() covers locally-driven workers that
-            # never went through the dispatcher path.
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-
             ok = kb.heartbeat_worker(
                 conn,
                 tid,
                 note=note,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
+                extend_claim=True,
+                claimer=claim_lock,
             )
             if not ok:
                 return tool_error(

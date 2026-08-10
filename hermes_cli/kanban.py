@@ -1440,12 +1440,15 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
+    scoped = bool(os.environ.get("HERMES_KANBAN_TASK"))
     with kb.connect_closing() as conn:
         ok = kb.heartbeat_worker(
             conn,
             args.task_id,
             note=getattr(args, "note", None),
             expected_run_id=_worker_run_id_for(args.task_id),
+            extend_claim=scoped,
+            claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
         )
     if not ok:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
@@ -2268,8 +2271,6 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(
                 conn,
                 tid,
@@ -2280,6 +2281,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
+                if reason:
+                    kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -2304,8 +2307,6 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
             if not kb.schedule_task(
                 conn,
                 tid,
@@ -2315,6 +2316,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
+                if reason:
+                    kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 

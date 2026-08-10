@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_home
 from agent.skill_preprocessing import (
     expand_inline_shell as _expand_inline_shell,
     load_skills_config as _load_skills_config,
@@ -782,6 +782,18 @@ def build_preloaded_skills_prompt(
             continue
 
         loaded_skill, skill_dir, skill_name = loaded
+
+        from agent.skill_integrity import verify_pinned_skill_tree
+
+        integrity_ok, integrity_error = verify_pinned_skill_tree(
+            skill_name,
+            skill_dir,
+            skills_root=get_hermes_home() / "skills",
+        )
+        if not integrity_ok:
+            logger.error("Refusing pinned skill preload: %s", integrity_error)
+            missing.append(identifier)
+            continue
 
         if skill_name in disabled_names or identifier in disabled_names:
             missing.append(identifier)

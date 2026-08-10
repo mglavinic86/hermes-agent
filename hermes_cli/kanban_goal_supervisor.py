@@ -9,22 +9,19 @@ from __future__ import annotations
 
 import json
 import re
-import stat
-import struct
 import time
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
+from agent.skill_integrity import compute_skill_tree_digest
 
 
 DURABLE_GOAL_SCHEMA_VERSION = 1
 DURABLE_GOAL_PROTOCOL_VERSION = 1
 _CANDIDATE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SKILL_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-_SKILL_DIGEST_CONTRACT = b"turpi-skill-snapshot-v1\0"
 
 
 @dataclass(frozen=True)
@@ -368,55 +365,7 @@ def _profile_skill_digest(profile: str, skill_name: str) -> Optional[str]:
     if declared != skill_name:
         return None
 
-    files: list[tuple[bytes, bytes]] = []
-    seen_inodes: set[tuple[int, int]] = set()
-    for path in skill_root_resolved.rglob("*"):
-        try:
-            relative = path.relative_to(skill_root_resolved)
-        except ValueError:
-            continue
-        current = skill_root_resolved
-        escaped = False
-        for part in relative.parts:
-            current = current / part
-            if current.is_symlink():
-                escaped = True
-                break
-        if escaped:
-            return None
-        try:
-            st = path.lstat()
-        except OSError:
-            return None
-        mode = st.st_mode
-        if stat.S_ISDIR(mode):
-            continue
-        if not stat.S_ISREG(mode) or stat.S_ISLNK(mode) or st.st_nlink != 1:
-            return None
-        inode = (int(st.st_dev), int(st.st_ino))
-        if inode in seen_inodes:
-            return None
-        seen_inodes.add(inode)
-        rel = relative.as_posix()
-        if rel.startswith("../") or rel == ".." or "\x00" in rel:
-            return None
-        try:
-            rel_bytes = rel.encode("utf-8")
-            data = path.read_bytes()
-        except (OSError, UnicodeError):
-            return None
-        files.append((rel_bytes, data))
-    if not any(rel == b"SKILL.md" for rel, _data in files):
-        return None
-    files.sort(key=lambda item: item[0])
-    digest = hashlib.sha256()
-    digest.update(_SKILL_DIGEST_CONTRACT)
-    for rel, data in files:
-        digest.update(struct.pack(">Q", len(rel)))
-        digest.update(rel)
-        digest.update(struct.pack(">Q", len(data)))
-        digest.update(data)
-    return digest.hexdigest()
+    return compute_skill_tree_digest(skill_root_resolved)
 
 
 def preflight_durable_dispatch(
