@@ -1867,6 +1867,56 @@ def test_pinned_reviewer_disables_inline_shell_after_snapshot_verification(
     assert discovery_calls == []
 
 
+def test_pinned_reviewer_missing_file_inventory_uses_verified_snapshot(
+    kanban_home, monkeypatch
+):
+    """Missing-file hints must not reopen the mutable live skill tree."""
+    from agent import skill_integrity
+    from tools.skills_tool import skill_view
+
+    skill_dir, _expected_digest, child_env = (
+        _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch)
+    )
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+
+    original_snapshot = skill_integrity._read_skill_tree_snapshot
+    injected = False
+
+    def snapshot_then_live_filename(path):
+        nonlocal injected
+        snapshot = original_snapshot(path)
+        if (
+            snapshot is not None
+            and not injected
+            and path.resolve() == skill_dir.resolve()
+        ):
+            injected = True
+            (skill_dir / "references" / "LIVE_UNCHECKED_FILENAME.md").write_text(
+                "unchecked",
+                encoding="utf-8",
+            )
+        return snapshot
+
+    monkeypatch.setattr(
+        skill_integrity,
+        "_read_skill_tree_snapshot",
+        snapshot_then_live_filename,
+    )
+
+    response = json.loads(
+        skill_view(
+            "immutable-change-reviews",
+            file_path="references/does-not-exist.md",
+        )
+    )
+    assert response["success"] is False
+    assert response["available_files"] == {
+        "references": ["references/rules.md"]
+    }
+    assert "LIVE_UNCHECKED_FILENAME" not in json.dumps(response)
+
+
 def test_durable_review_without_pinned_digest_never_spawns(
     kanban_home, monkeypatch
 ):

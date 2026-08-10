@@ -1371,7 +1371,17 @@ def skill_view(
                     },
                     ensure_ascii=False,
                 )
-            if not target_file.exists():
+            try:
+                snapshot_key = target_file.relative_to(skill_dir).as_posix()
+            except ValueError:
+                snapshot_key = ""
+
+            target_missing = (
+                snapshot_key not in pinned_snapshot
+                if pinned_snapshot is not None
+                else not target_file.exists()
+            )
+            if target_missing:
                 # List available files in the skill directory, organized by type
                 available_files = {
                     "references": [],
@@ -1381,28 +1391,38 @@ def skill_view(
                     "other": [],
                 }
 
-                # Scan for all readable files
-                for f in skill_dir.rglob("*"):
-                    if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
-                        if rel.startswith("references/"):
-                            available_files["references"].append(rel)
-                        elif rel.startswith("templates/"):
-                            available_files["templates"].append(rel)
-                        elif rel.startswith("assets/"):
-                            available_files["assets"].append(rel)
-                        elif rel.startswith("scripts/"):
-                            available_files["scripts"].append(rel)
-                        elif f.suffix in {
-                            ".md",
-                            ".py",
-                            ".yaml",
-                            ".yml",
-                            ".json",
-                            ".tex",
-                            ".sh",
-                        }:
-                            available_files["other"].append(rel)
+                if pinned_snapshot is not None:
+                    available_candidates = [
+                        (rel, PurePosixPath(rel).suffix)
+                        for rel in sorted(pinned_snapshot)
+                        if rel != "SKILL.md"
+                    ]
+                else:
+                    available_candidates = [
+                        (str(f.relative_to(skill_dir)), f.suffix)
+                        for f in skill_dir.rglob("*")
+                        if f.is_file() and f.name != "SKILL.md"
+                    ]
+
+                for rel, suffix in available_candidates:
+                    if rel.startswith("references/"):
+                        available_files["references"].append(rel)
+                    elif rel.startswith("templates/"):
+                        available_files["templates"].append(rel)
+                    elif rel.startswith("assets/"):
+                        available_files["assets"].append(rel)
+                    elif rel.startswith("scripts/"):
+                        available_files["scripts"].append(rel)
+                    elif suffix in {
+                        ".md",
+                        ".py",
+                        ".yaml",
+                        ".yml",
+                        ".json",
+                        ".tex",
+                        ".sh",
+                    }:
+                        available_files["other"].append(rel)
 
                 # Remove empty categories
                 available_files = {k: v for k, v in available_files.items() if v}
@@ -1416,11 +1436,6 @@ def skill_view(
                     },
                     ensure_ascii=False,
                 )
-
-            try:
-                snapshot_key = target_file.relative_to(skill_dir).as_posix()
-            except ValueError:
-                snapshot_key = ""
 
             # Read pinned content from the verified byte snapshot, never from a
             # second mutable filesystem read.
