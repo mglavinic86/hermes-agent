@@ -453,7 +453,7 @@ def _validated_terminal_event(conn, binding: DurableGoalTask):
     row = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? "
         "AND kind IN ('completed', 'gave_up', 'blocked', 'dependency_wait', "
-        "'block_loop_detected', 'scheduled') "
+        "'block_loop_detected', 'scheduled', 'archived', 'status') "
         "ORDER BY id DESC LIMIT 1",
         (binding.task_id,),
     ).fetchone()
@@ -591,14 +591,20 @@ def supervise_goal_once(
         "dependency_wait",
         "block_loop_detected",
         "scheduled",
+        "archived",
+        "status",
     }:
         event_payload = _decode_object(event["payload"]) or {}
         event_reason = str(event_payload.get("reason") or "").strip()
-        reason = f"durable task {event['kind']} during {binding.stage}"
+        event_label = str(event["kind"])
+        if event_label == "status":
+            direct_status = str(event_payload.get("status") or "unknown").strip()
+            event_label = f"status:{direct_status}"
+        reason = f"durable task {event_label} during {binding.stage}"
         if event_reason:
             reason = f"{reason}: {event_reason}"
         completion_payload = dict(event_payload)
-        completion_payload["event"] = str(event["kind"])
+        completion_payload["event"] = event_label
         blocked = kb.transition_durable_goal_to_terminal(
             conn,
             goal_id=goal.id,
@@ -614,7 +620,7 @@ def supervise_goal_once(
                 "objective": goal.objective,
                 "candidate_sha": goal.candidate_sha,
                 "status": "BLOCKED",
-                "event": str(event["kind"]),
+                "event": event_label,
                 "reason": reason,
             },
             blocked_reason=reason,

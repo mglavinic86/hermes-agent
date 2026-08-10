@@ -7436,13 +7436,20 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Permanently remove an already-archived task and its related rows.
+    """Permanently remove an ordinary archived task and its related rows.
 
     Safety guard: only archived tasks can be deleted. Active / blocked / done
     tasks must be explicitly archived first so accidental data loss requires a
-    second deliberate action.
+    second deliberate action. Durable-goal tasks are never purged because their
+    bindings and event history are part of the durable replay contract.
     """
     with write_txn(conn):
+        durable_binding = conn.execute(
+            "SELECT 1 FROM kanban_goal_tasks WHERE task_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if durable_binding is not None:
+            return False
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),

@@ -2419,6 +2419,12 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     if not ids and not purge_ids:
         print("at least one task_id is required", file=sys.stderr)
         return 1
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        print(
+            "kanban: dispatcher-scoped workers cannot archive or purge tasks",
+            file=sys.stderr,
+        )
+        return 1
     failed: list[str] = []
     with kb.connect_closing() as conn:
         if purge_ids:

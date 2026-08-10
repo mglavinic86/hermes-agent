@@ -404,6 +404,8 @@ def test_build_gave_up_reserves_one_repair_and_replay_creates_no_duplicate(
         ("dependency_wait", "dependency"),
         ("block_loop_detected", "needs_input"),
         ("scheduled", None),
+        ("archived", None),
+        ("status:triage", None),
     ],
 )
 def test_current_run_park_or_block_terminates_goal_and_notifies_once(
@@ -434,6 +436,13 @@ def test_current_run_park_or_block_terminates_goal_and_notifies_once(
                 reason="wait for owner window",
                 expected_run_id=task.current_run_id,
             )
+        elif terminal_event == "archived":
+            assert kb.archive_task(conn, task.id)
+            assert not kb.delete_archived_task(conn, task.id)
+        elif terminal_event == "status:triage":
+            from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+            assert _set_status_direct(conn, task.id, "triage")
         else:
             if terminal_event == "block_loop_detected":
                 conn.execute(
@@ -473,6 +482,58 @@ def test_current_run_park_or_block_terminates_goal_and_notifies_once(
     assert len(bindings) == 1 and bindings[0].completion_event_id is not None
     assert [item.kind for item in notifications] == ["BLOCKED"]
     assert notifications[0].payload["event"] == terminal_event
+
+
+def test_dispatcher_scoped_worker_cannot_archive_own_or_foreign_task(
+    kanban_home, monkeypatch
+):
+    from argparse import Namespace
+    from hermes_cli import profiles
+    from hermes_cli.kanban import _cmd_archive
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    with kb.connect() as conn:
+        own = create_durable_goal(
+            conn,
+            objective="own durable task",
+            origin=GoalOrigin(platform="telegram", chat_id="owner-chat"),
+            board="default",
+            builder_profile="builder",
+            verifier_profile="verifier",
+            reviewer_profile="reviewer",
+            repair_budget=1,
+            review_retry_budget=1,
+        )
+        foreign = create_durable_goal(
+            conn,
+            objective="foreign durable task",
+            origin=GoalOrigin(platform="telegram", chat_id="owner-chat-2"),
+            board="default",
+            builder_profile="builder",
+            verifier_profile="verifier",
+            reviewer_profile="reviewer",
+            repair_budget=1,
+            review_retry_budget=1,
+        )
+        own_task = kb.claim_task(conn, own.task_id, claimer="builder")
+        foreign_task = kb.claim_task(conn, foreign.task_id, claimer="builder")
+        assert own_task is not None and own_task.current_run_id is not None
+        assert foreign_task is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", own.task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(own_task.current_run_id))
+    assert (
+        _cmd_archive(
+            Namespace(task_ids=[own.task_id, foreign.task_id], purge_ids=[])
+        )
+        == 1
+    )
+
+    with kb.connect() as conn:
+        own_after = kb.get_task(conn, own.task_id)
+        foreign_after = kb.get_task(conn, foreign.task_id)
+        assert own_after is not None and own_after.status == "running"
+        assert foreign_after is not None and foreign_after.status == "running"
 
 
 def test_structured_build_completion_binds_current_run_and_creates_verify(
