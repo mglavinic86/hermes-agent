@@ -1668,6 +1668,8 @@ def run_kanban_goal_loop(
     block_fn,
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
+    initial_turns_used: Optional[int] = None,
+    reserve_turn_fn=None,
     log=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
@@ -1687,11 +1689,11 @@ def run_kanban_goal_loop(
        terminated the task, ``block_fn`` is invoked so the card lands in a
        sticky ``blocked`` state for human review (NOT a silent exit).
 
-    This function performs NO SessionDB persistence — a worker process is
-    ephemeral, so the turn budget lives in a local counter. It is fully
-    decoupled from the CLI for testability: callers inject ``run_turn``
-    (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
-    (reason: str -> None).
+    The dispatcher path injects ``initial_turns_used`` and an atomic
+    ``reserve_turn_fn`` backed by the kanban DB, making the task-level budget
+    cumulative across worker crashes/restarts. Callers that omit both retain
+    the historical in-process counter for backwards compatibility and unit
+    embedding. The loop remains decoupled from the CLI for testability.
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
@@ -1710,8 +1712,14 @@ def run_kanban_goal_loop(
         max_turns = DEFAULT_MAX_TURNS
 
     last_response = first_response or ""
-    # The first turn already consumed one unit of budget.
-    turns_used = 1
+    # The first turn already consumed one unit of budget. Hardened dispatcher
+    # callers persist that reservation before invoking the model and pass the
+    # cumulative count here; legacy callers keep the old local counter.
+    turns_used = (
+        max(0, int(initial_turns_used))
+        if initial_turns_used is not None
+        else 1
+    )
     nudged_to_finalize = False
 
     while True:
@@ -1773,13 +1781,47 @@ def run_kanban_goal_loop(
                 _log(f"kanban goal loop: block_fn failed ({exc})")
             return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
 
+        # Atomically reserve the next cumulative task-level turn before the
+        # model call. A crash after this point may conservatively spend one
+        # turn, but retries can never reset or exceed the cap.
+        if reserve_turn_fn is not None:
+            try:
+                reserved = reserve_turn_fn()
+            except Exception as exc:
+                _log(f"kanban goal loop: turn reservation failed ({exc}); stopping")
+                return {
+                    "outcome": "stopped",
+                    "turns_used": turns_used,
+                    "reason": "turn reservation failed",
+                }
+            if reserved is None:
+                _log(
+                    f"kanban goal loop: task {task_id} could not reserve "
+                    "another cumulative turn; blocking"
+                )
+                try:
+                    block_fn(
+                        f"Goal-mode worker could not reserve another turn "
+                        f"({turns_used}/{max_turns}); the cumulative budget is "
+                        "exhausted or this worker run is stale."
+                    )
+                except Exception as exc:
+                    _log(f"kanban goal loop: block_fn failed ({exc})")
+                return {
+                    "outcome": "blocked_budget",
+                    "turns_used": turns_used,
+                    "reason": "turn reservation denied",
+                }
+            turns_used = int(reserved)
+
         # Run another turn in the same session.
         try:
             last_response = run_turn(prompt) or ""
         except Exception as exc:
             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
-        turns_used += 1
+        if reserve_turn_fn is None:
+            turns_used += 1
 
 
 __all__ = [

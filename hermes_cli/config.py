@@ -1543,6 +1543,14 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Trusted dispatcher role mapping. Profiles not listed here are
+        # workers. Reviewers keep verdict/lifecycle reads+writes but cannot
+        # route the board or upload evidence; orchestrators retain routing.
+        # The legacy ``orchestrator_profile`` key is also honored.
+        "role_profiles": {
+            "reviewer": [],
+            "orchestrator": [],
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

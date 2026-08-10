@@ -133,9 +133,68 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_KANBAN_ROLES = frozenset({"worker", "reviewer", "orchestrator"})
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_KANBAN_GOAL_MAX_TURNS = 20
+
+
+def resolve_dispatched_role(
+    profile: Optional[str],
+    *,
+    config: Optional[dict] = None,
+    forced_role: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the trusted role stamped into a dispatched worker's env.
+
+    Role authority comes from dispatcher config, never from task/model input.
+    ``kanban.role_profiles`` maps ``reviewer`` and ``orchestrator`` to profile
+    names. Once any explicit mapping is configured, every unlisted profile is
+    a worker. With no explicit mapping, unlisted profiles return ``None`` so
+    existing installations retain their pre-hardening surface. The historical
+    ``kanban.orchestrator_profile`` setting remains an orchestrator alias.
+    Ambiguous mappings fail closed to ``worker``. ``forced_role`` is reserved
+    for kernel-owned lanes such as the native ``review`` queue.
+    """
+    forced = str(forced_role or "").strip().lower()
+    if forced:
+        return forced if forced in VALID_KANBAN_ROLES else "worker"
+
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+    kanban_cfg = (config or {}).get("kanban") or {}
+    role_profiles = kanban_cfg.get("role_profiles") or {}
+    normalized_profile = str(profile or "").strip()
+
+    matched: set[str] = set()
+    explicit_mapping_enabled = False
+    for role in ("reviewer", "orchestrator"):
+        raw = role_profiles.get(role, ()) if isinstance(role_profiles, dict) else ()
+        if isinstance(raw, str):
+            names = {raw.strip()} if raw.strip() else set()
+        elif isinstance(raw, (list, tuple, set)):
+            names = {str(value).strip() for value in raw if str(value).strip()}
+        else:
+            names = set()
+        explicit_mapping_enabled = explicit_mapping_enabled or bool(names)
+        if normalized_profile and normalized_profile in names:
+            matched.add(role)
+
+    legacy_orchestrator = str(kanban_cfg.get("orchestrator_profile") or "").strip()
+    if normalized_profile and normalized_profile == legacy_orchestrator:
+        matched.add("orchestrator")
+
+    if len(matched) == 1:
+        return next(iter(matched))
+    if len(matched) > 1 or explicit_mapping_enabled:
+        return "worker"
+    return None
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -902,6 +961,10 @@ class Task:
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
+    # Durable cumulative goal-turn usage across every worker attempt. Unlike
+    # task_runs, this intentionally survives reclaim/crash/restart so retries
+    # cannot reset the task-level budget.
+    goal_turns_used: int = 0
     # Originating chat/agent session id, when the task was created from
     # within an agent loop that propagated ``HERMES_SESSION_ID``. NULL for
     # tasks created from the CLI, the dashboard, or any path that doesn't
@@ -915,6 +978,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Ephemeral dispatcher provenance; never persisted or accepted from task
+    # creation input. Used to force kernel-owned lanes (currently review).
+    dispatch_role: Optional[str] = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -987,6 +1053,11 @@ class Task:
             ),
             goal_max_turns=(
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
+            ),
+            goal_turns_used=(
+                int(row["goal_turns_used"])
+                if "goal_turns_used" in keys and row["goal_turns_used"] is not None
+                else 0
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
@@ -1158,6 +1229,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
+    -- Cumulative turns reserved by every goal-mode worker attempt. This is
+    -- task-scoped (not run-scoped) so crash/reclaim/restart cannot reset it.
+    goal_turns_used      INTEGER NOT NULL DEFAULT 0,
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
     -- for tasks created from the CLI, dashboard, or any path that doesn't
@@ -1960,6 +2034,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # Per-task goal-loop turn budget. NULL = goals-engine default.
         _add_column_if_missing(
             conn, "tasks", "goal_max_turns", "goal_max_turns INTEGER"
+        )
+
+    if "goal_turns_used" not in cols:
+        # Durable task-level goal budget usage. Existing cards have consumed no
+        # tracked turns under the old local-counter implementation, so zero is
+        # the only safe backwards-compatible migration value.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "goal_turns_used",
+            "goal_turns_used INTEGER NOT NULL DEFAULT 0",
         )
 
     if "session_id" not in cols:
@@ -3497,6 +3582,31 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        budget = conn.execute(
+            "SELECT goal_mode, goal_max_turns, goal_turns_used "
+            "FROM tasks WHERE id = ? AND status = 'ready'",
+            (task_id,),
+        ).fetchone()
+        if budget and bool(budget["goal_mode"]):
+            max_turns = budget["goal_max_turns"] or DEFAULT_KANBAN_GOAL_MAX_TURNS
+            if int(budget["goal_turns_used"] or 0) >= int(max_turns):
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', "
+                    "last_failure_error = ? "
+                    "WHERE id = ? AND status = 'ready'",
+                    ("cumulative goal turn budget exhausted", task_id),
+                )
+                payload = {
+                    "reason": "goal_turn_budget_exhausted",
+                    "turns_used": int(budget["goal_turns_used"] or 0),
+                    "max_turns": int(max_turns),
+                }
+                _append_event(conn, task_id, "claim_rejected", payload)
+                # Budget exhaustion is a deliberate human-review handoff,
+                # not a transient claim failure. Record a sticky block so
+                # recompute_ready cannot churn it back to ready.
+                _append_event(conn, task_id, "blocked", payload)
+                return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3676,6 +3786,66 @@ def claim_review_task(
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def reserve_goal_turn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    max_turns: int,
+    expected_run_id: Optional[int] = None,
+) -> Optional[int]:
+    """Atomically reserve one cumulative goal-mode turn for ``task_id``.
+
+    The counter lives on the task rather than the run, so a worker crash,
+    reclaim, or process restart cannot reset the budget. Reservation happens
+    before each model turn; a crash after reservation may conservatively spend
+    one turn, but can never overspend the declared cap. A positive
+    ``expected_run_id`` is mandatory so a stale/reclaimed worker cannot consume
+    its successor's budget by omitting or corrupting its run identity.
+
+    Returns the new cumulative count, or ``None`` when the budget is exhausted,
+    the task/run is stale, or the card is not an active goal-mode task.
+    """
+    try:
+        limit = int(max_turns)
+    except (TypeError, ValueError):
+        return None
+    if limit < 1:
+        return None
+
+    try:
+        run_id = int(expected_run_id) if expected_run_id is not None else None
+    except (TypeError, ValueError):
+        return None
+    if run_id is None or run_id < 1:
+        return None
+
+    params: list[Any] = [task_id, limit, run_id]
+
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks "
+            "SET goal_turns_used = goal_turns_used + 1 "
+            "WHERE id = ? AND goal_mode = 1 AND status = 'running' "
+            "AND goal_turns_used < ? AND current_run_id = ?",
+            tuple(params),
+        )
+        if cur.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT goal_turns_used, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        used = int(row["goal_turns_used"])
+        _append_event(
+            conn,
+            task_id,
+            "goal_turn_reserved",
+            {"turns_used": used, "max_turns": limit},
+            run_id=row["current_run_id"],
+        )
+    return used
 
 
 def heartbeat_claim(
@@ -4158,9 +4328,19 @@ def complete_task(
     else:
         verified_cards = []
 
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
+    dispatch_role = (
+        metadata.get("_kanban_dispatch_role")
+        if isinstance(metadata, dict)
+        else None
     )
+    if dispatch_role == "reviewer":
+        metadata = dict(metadata or {})
+        metadata.pop("artifacts", None)
+        metadata.pop("_staged_artifacts", None)
+    else:
+        metadata = _merge_completion_prose_artifacts(
+            conn, task_id, metadata, summary=summary, result=result,
+        )
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4238,6 +4418,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if dispatch_role is not None:
+            completed_payload["dispatch_role"] = dispatch_role
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -7879,6 +8061,10 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
+        # Kernel-owned review queue: role provenance comes from the dispatch
+        # transition, not from the assignee/task body/model. _default_spawn
+        # stamps this trusted value into HERMES_KANBAN_ROLE.
+        claimed.dispatch_role = "reviewer"
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -8194,6 +8380,13 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    env.pop("HERMES_KANBAN_ROLE", None)
+    dispatched_role = resolve_dispatched_role(
+        profile_arg,
+        forced_role=task.dispatch_role,
+    )
+    if dispatched_role:
+        env["HERMES_KANBAN_ROLE"] = dispatched_role
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root

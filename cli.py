@@ -15477,6 +15477,61 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+
+def _kanban_goal_run_id_from_env() -> "int | None":
+    raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        run_id = int(raw) if raw else None
+    except ValueError:
+        return None
+    return run_id if run_id is not None and run_id > 0 else None
+
+
+def _reserve_kanban_goal_first_turn_q() -> bool:
+    """Reserve the first durable task-level goal turn before model execution."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return False
+
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli.goals import DEFAULT_MAX_TURNS as _DEF_TURNS
+
+    expected_run_id = _kanban_goal_run_id_from_env()
+    if expected_run_id is None:
+        logger.error(
+            "kanban goal turn reservation refused: missing or invalid run identity"
+        )
+        return False
+    conn = _kb.connect()
+    try:
+        task = _kb.get_task(conn, task_id)
+        if task is None or not task.goal_mode:
+            return False
+        max_turns = task.goal_max_turns or _DEF_TURNS
+        reserved = _kb.reserve_goal_turn(
+            conn,
+            task_id,
+            max_turns=max_turns,
+            expected_run_id=expected_run_id,
+        )
+        if reserved is not None:
+            return True
+        # Fail closed: never spend an unreserved model turn. The run-id guard
+        # prevents a stale worker from blocking a successor after reclaim.
+        _kb.block_task(
+            conn,
+            task_id,
+            reason=(
+                "Goal-mode worker could not reserve its first cumulative turn "
+                f"({task.goal_turns_used}/{max_turns}); budget exhausted or run stale."
+            ),
+            expected_run_id=expected_run_id,
+        )
+        return False
+    finally:
+        conn.close()
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -15517,6 +15572,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
+    expected_run_id = _kanban_goal_run_id_from_env()
+    if expected_run_id is None:
+        logger.error(
+            "kanban goal loop refused: missing or invalid run identity"
+        )
+        return
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
@@ -15534,6 +15595,18 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             print(resp)
         return resp or ""
 
+    def _reserve_turn() -> "int | None":
+        c = _kb.connect()
+        try:
+            return _kb.reserve_goal_turn(
+                c,
+                task_id,
+                max_turns=max_turns,
+                expected_run_id=expected_run_id,
+            )
+        finally:
+            c.close()
+
     def _task_status() -> "str | None":
         c = _kb.connect()
         try:
@@ -15548,7 +15621,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            _kb.block_task(
+                c,
+                task_id,
+                reason=reason,
+                expected_run_id=expected_run_id,
+            )
         finally:
             try:
                 c.close()
@@ -15563,6 +15641,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         block_fn=_block,
         max_turns=max_turns,
         first_response=first_response or "",
+        initial_turns_used=task.goal_turns_used,
+        reserve_turn_fn=_reserve_turn,
         log=lambda m: logger.info("%s", m),
     )
 
@@ -15975,6 +16055,24 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                            try:
+                                _goal_turn_reserved = _reserve_kanban_goal_first_turn_q()
+                            except Exception as _reserve_exc:
+                                logger.error(
+                                    "kanban goal turn reservation failed: %s",
+                                    _reserve_exc,
+                                )
+                                sys.exit(1)
+                            if not _goal_turn_reserved:
+                                # The helper blocks an exhausted current run and
+                                # refuses stale runs. Either way, do not spend an
+                                # unreserved model turn.
+                                print(
+                                    "kanban goal turn not reserved; worker stopped",
+                                    file=sys.stderr,
+                                )
+                                sys.exit(0)
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
