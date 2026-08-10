@@ -1863,6 +1863,8 @@ def test_pinned_reviewer_disables_inline_shell_after_snapshot_verification(
     assert "Verified literal: !`cat SKILL.md`" in viewed["content"]
     assert "Verified directory token: ${HERMES_SKILL_DIR}" in viewed["content"]
     assert "MUTATED_UNCHECKED_BODY" not in viewed["content"]
+    assert "path" not in viewed
+    assert "skill_dir" not in viewed
     assert shell_calls == []
     assert discovery_calls == []
 
