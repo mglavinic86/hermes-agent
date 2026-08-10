@@ -38,7 +38,7 @@ The role is resolved from dispatcher configuration, not task text or model outpu
 | Reviewer | Verdict/lifecycle operations, comments, attachment reads; no board routing or artifact upload |
 | Orchestrator | Full board routing plus lifecycle and artifact operations |
 
-This boundary governs the `kanban_*` surface. OS/filesystem/network isolation and external credentials still belong in profile toolsets and deployment/container policy. For backwards compatibility, manually launched legacy task environments that set `HERMES_KANBAN_TASK` without a role retain the pre-hardening surface; the bundled dispatcher always stamps a role.
+This boundary governs the `kanban_*` surface. OS/filesystem/network isolation and external credentials still belong in profile toolsets and deployment/container policy. Explicit worker/reviewer dispatches are pinned to the dispatcher-selected board even if a model supplies a `board` argument. For backwards compatibility, task environments without an explicit role retain the pre-hardening surface; the bundled dispatcher stamps roles only after `kanban.role_profiles` is explicitly configured.
 
 This is the shape that covers the workloads `delegate_task` can't:
 

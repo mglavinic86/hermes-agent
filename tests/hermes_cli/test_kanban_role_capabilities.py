@@ -93,6 +93,140 @@ def test_reviewer_is_read_only_except_verdict_lifecycle(monkeypatch):
         assert denied is not None, denied_tool
 
 
+def test_reviewer_schema_hides_board_routing_and_artifact_publication(monkeypatch):
+    from tools.registry import invalidate_check_fn_cache
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setenv("HERMES_KANBAN_ROLE", "reviewer")
+    invalidate_check_fn_cache()
+
+    definitions = kt.registry.get_definitions(
+        set(kt.KANBAN_ROLE_CAPABILITIES["orchestrator"])
+    )
+    by_name = {d["function"]["name"]: d["function"] for d in definitions}
+
+    assert "board" not in by_name["kanban_show"]["parameters"]["properties"]
+    complete_props = by_name["kanban_complete"]["parameters"]["properties"]
+    assert "board" not in complete_props
+    assert "artifacts" not in complete_props
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"summary": "reviewed", "artifacts": ["report.txt"]},
+        {"summary": "reviewed", "metadata": {"artifacts": ["report.txt"]}},
+    ],
+)
+def test_reviewer_complete_cannot_smuggle_artifact_writes(monkeypatch, payload):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setenv("HERMES_KANBAN_ROLE", "reviewer")
+    monkeypatch.setattr(
+        kt,
+        "_connect",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("DB_REACHED")
+        ),
+    )
+
+    result = kt._handle_complete(payload)
+
+    assert "artifact" in result.lower()
+    assert "reviewer" in result.lower()
+
+
+@pytest.mark.parametrize("role", ["worker", "reviewer"])
+def test_hardened_non_orchestrator_cannot_override_board(monkeypatch, role):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_scoped")
+    monkeypatch.setenv("HERMES_KANBAN_ROLE", role)
+
+    with pytest.raises(PermissionError, match="board routing"):
+        kt._connect(board="foreign-board")
+
+
+@pytest.mark.parametrize("role", ["worker", "reviewer"])
+def test_foreign_board_read_and_write_handlers_fail_before_task_id_collision(
+    kanban_home, monkeypatch, role
+):
+    with kb.connect() as conn:
+        own_tid = kb.create_task(conn, title="own", assignee="builder")
+
+    kb.create_board("foreign-board")
+    with kb.connect(board="foreign-board") as conn:
+        foreign_tid = kb.create_task(conn, title="foreign", assignee="other")
+        conn.execute("UPDATE tasks SET id=? WHERE id=?", (own_tid, foreign_tid))
+        conn.commit()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", own_tid)
+    monkeypatch.setenv("HERMES_KANBAN_ROLE", role)
+
+    read_result = kt._handle_show({"task_id": own_tid, "board": "foreign-board"})
+    write_result = kt._handle_complete(
+        {"task_id": own_tid, "board": "foreign-board", "summary": "foreign done"}
+    )
+
+    assert "board routing" in read_result.lower()
+    assert "board routing" in write_result.lower()
+    with kb.connect(board="foreign-board") as conn:
+        foreign = kb.get_task(conn, own_tid)
+        assert foreign is not None
+        assert foreign.status == "ready"
+        assert foreign.title == "foreign"
+
+
+def test_reviewer_completion_prose_does_not_publish_artifact(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review", assignee="reviewer")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        workspace.mkdir(parents=True, exist_ok=True)
+        artifact = workspace / "review.txt"
+        artifact.write_text("not reviewer-publishable", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_ROLE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    result = kt._handle_complete(
+        {
+            "summary": f"review complete: {artifact}",
+            "metadata": {"_kanban_dispatch_role": "worker"},
+        }
+    )
+
+    assert '"ok": true' in result.lower()
+    with kb.connect() as conn:
+        assert kb.list_attachments(conn, tid) == []
+        completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"][-1]
+        assert isinstance(completed.payload, dict)
+        assert completed.payload["dispatch_role"] == "reviewer"
+        assert "artifacts" not in completed.payload
+
+
+def test_legacy_worker_without_role_keeps_explicit_board_override(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_legacy")
+    monkeypatch.delenv("HERMES_KANBAN_ROLE", raising=False)
+    sentinel = object()
+    seen = []
+
+    monkeypatch.setattr(
+        kb,
+        "connect",
+        lambda *, board=None: seen.append(board) or sentinel,
+    )
+
+    module, conn = kt._connect(board="legacy-board")
+
+    assert module is kb
+    assert conn is sentinel
+    assert seen == ["legacy-board"]
+
+
 def test_orchestrator_has_routing_capabilities(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_plan")
     monkeypatch.setenv("HERMES_KANBAN_ROLE", "orchestrator")

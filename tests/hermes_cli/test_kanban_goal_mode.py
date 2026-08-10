@@ -161,6 +161,15 @@ def test_exhausted_goal_budget_blocks_before_new_run_is_created(kanban_home):
         assert task.goal_turns_used == 2
         assert len(kb.list_runs(conn, tid)) == runs_before
 
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        blocked_events = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+        assert blocked_events
+        assert isinstance(blocked_events[-1].payload, dict)
+        assert blocked_events[-1].payload["reason"] == "goal_turn_budget_exhausted"
+
 
 def test_goal_mode_without_max_turns(kanban_home):
     with kb.connect() as conn:

@@ -655,8 +655,16 @@ class GatewayKanbanWatchersMixin:
 
         Files are deduplicated, missing files are silently skipped (the
         path may have been mentioned for reference only), and delivery
-        errors are logged but do not break the notifier loop.
+        errors are logged but do not break the notifier loop. Reviewer
+        completion events are verdict-only and never publish local files,
+        including paths found in summary/result prose.
         """
+        if (
+            isinstance(event_payload, dict)
+            and event_payload.get("dispatch_role") == "reviewer"
+        ):
+            return
+
         from pathlib import Path as _Path
 
         candidates: list[str] = []

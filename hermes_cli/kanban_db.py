@@ -3596,16 +3596,16 @@ def claim_task(
                     "WHERE id = ? AND status = 'ready'",
                     ("cumulative goal turn budget exhausted", task_id),
                 )
-                _append_event(
-                    conn,
-                    task_id,
-                    "claim_rejected",
-                    {
-                        "reason": "goal_turn_budget_exhausted",
-                        "turns_used": int(budget["goal_turns_used"] or 0),
-                        "max_turns": int(max_turns),
-                    },
-                )
+                payload = {
+                    "reason": "goal_turn_budget_exhausted",
+                    "turns_used": int(budget["goal_turns_used"] or 0),
+                    "max_turns": int(max_turns),
+                }
+                _append_event(conn, task_id, "claim_rejected", payload)
+                # Budget exhaustion is a deliberate human-review handoff,
+                # not a transient claim failure. Record a sticky block so
+                # recompute_ready cannot churn it back to ready.
+                _append_event(conn, task_id, "blocked", payload)
                 return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -4324,9 +4324,19 @@ def complete_task(
     else:
         verified_cards = []
 
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
+    dispatch_role = (
+        metadata.get("_kanban_dispatch_role")
+        if isinstance(metadata, dict)
+        else None
     )
+    if dispatch_role == "reviewer":
+        metadata = dict(metadata or {})
+        metadata.pop("artifacts", None)
+        metadata.pop("_staged_artifacts", None)
+    else:
+        metadata = _merge_completion_prose_artifacts(
+            conn, task_id, metadata, summary=summary, result=result,
+        )
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4404,6 +4414,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if dispatch_role is not None:
+            completed_payload["dispatch_role"] = dispatch_role
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
