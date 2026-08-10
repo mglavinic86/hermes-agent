@@ -19,6 +19,27 @@ The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
 
+#### Dispatcher-enforced Kanban roles
+
+The dispatcher stamps a trusted `worker`, `reviewer`, or `orchestrator` role into each spawned process once `kanban.role_profiles` is explicitly configured. Unlisted profiles then default to `worker`, and the older `kanban.orchestrator_profile` setting remains an orchestrator alias:
+
+```yaml
+kanban:
+  role_profiles:
+    reviewer: [security-reviewer]
+    orchestrator: [project-lead]
+```
+
+The role is resolved from dispatcher configuration, not task text or model output. Explicit roles are enforced twice: unavailable tools are omitted from the model schema, and every registered handler re-checks the capability before execution.
+
+| Role | Kanban capabilities |
+|---|---|
+| Worker | Own-task lifecycle, comments, attachment read/write; no board routing |
+| Reviewer | Verdict/lifecycle operations, comments, attachment reads; no board routing or artifact upload |
+| Orchestrator | Full board routing plus lifecycle and artifact operations |
+
+This boundary governs the `kanban_*` surface. OS/filesystem/network isolation and external credentials still belong in profile toolsets and deployment/container policy. For backwards compatibility, manually launched legacy task environments that set `HERMES_KANBAN_TASK` without a role retain the pre-hardening surface; the bundled dispatcher always stamps a role.
+
 This is the shape that covers the workloads `delegate_task` can't:
 
 - **Research triage** — parallel researchers + analyst + writer, human-in-the-loop.
@@ -457,6 +478,8 @@ The dispatcher emits one `--skills <name>` flag per skill listed, so the worker 
 ### Goal-mode cards (`--goal`)
 
 By default each worker gets **one shot** at its card — do the work, call `kanban_complete`/`kanban_block`, exit. Pass `--goal` (CLI) or `goal_mode=True` (the `kanban_create` tool / dashboard) to instead run that worker in a **goal loop**, the same Ralph-style engine behind the `/goal` slash command: after every turn an auxiliary judge checks the worker's output against the card's title + body (treated as the acceptance criteria), and if the work isn't done — and the turn budget remains — the worker keeps going **in the same session** until the judge agrees, the worker terminates the task itself, or the budget runs out (which **blocks** the card for human review rather than exiting silently).
+
+The turn counter is durable and cumulative on the task. Every model turn is atomically reserved before execution, guarded by the current run id, so a crash/reclaim/restart cannot reset or overspend the budget. Once exhausted, the next claim is rejected and the card is blocked before a replacement run is created. A crash immediately after reservation may conservatively spend that turn; this fail-closed behavior prevents hidden budget expansion.
 
 ```bash
 hermes kanban create "Translate the docs site to French" \

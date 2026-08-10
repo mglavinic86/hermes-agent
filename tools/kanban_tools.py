@@ -29,6 +29,7 @@ through the board.
 from __future__ import annotations
 
 import json
+import functools
 import logging
 import os
 from typing import Any, Optional
@@ -47,6 +48,70 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+
+KANBAN_ROLE_CAPABILITIES = {
+    "worker": frozenset({
+        "kanban_show", "kanban_complete", "kanban_block",
+        "kanban_heartbeat", "kanban_comment", "kanban_attach",
+        "kanban_attach_url", "kanban_attachments",
+    }),
+    "reviewer": frozenset({
+        "kanban_show", "kanban_complete", "kanban_block",
+        "kanban_heartbeat", "kanban_comment", "kanban_attachments",
+    }),
+    "orchestrator": frozenset({
+        "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
+        "kanban_heartbeat", "kanban_comment", "kanban_attach",
+        "kanban_attach_url", "kanban_attachments", "kanban_create",
+        "kanban_unblock", "kanban_link",
+    }),
+}
+
+
+def _explicit_dispatched_role() -> Optional[str]:
+    """Return trusted dispatcher role, ``None`` for legacy/unscoped sessions."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    raw = os.environ.get("HERMES_KANBAN_ROLE")
+    if raw is None:
+        return None
+    return raw.strip().lower()
+
+
+def _require_kanban_capability(tool_name: str) -> Optional[str]:
+    """Handler-level guard for explicit dispatcher role capabilities.
+
+    Legacy task environments without ``HERMES_KANBAN_ROLE`` retain the old
+    surface. New dispatchers always stamp a trusted role. Unknown explicit
+    roles fail closed instead of silently inheriting worker powers.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    role = _explicit_dispatched_role()
+    if role is None:
+        return None
+    allowed = KANBAN_ROLE_CAPABILITIES.get(role)
+    if allowed is None:
+        return tool_error(
+            f"invalid dispatched kanban role {role!r}; refusing {tool_name}"
+        )
+    if tool_name not in allowed:
+        return tool_error(
+            f"{tool_name} is not permitted for dispatched kanban role {role}; "
+            "board routing is orchestrator-only and reviewer artifact writes "
+            "are disabled"
+        )
+    return None
+
+
+def _guarded_handler(tool_name: str, handler):
+    """Apply the runtime role guard even if registry visibility is stale."""
+    @functools.wraps(handler)
+    def _wrapped(args: dict, **kw):
+        denied = _require_kanban_capability(tool_name)
+        return denied if denied else handler(args, **kw)
+
+    return _wrapped
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -75,7 +140,8 @@ def _check_kanban_mode() -> bool:
     toolset enabled see the Kanban lifecycle tool surface.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
-        return True
+        role = _explicit_dispatched_role()
+        return role is None or role in KANBAN_ROLE_CAPABILITIES
     return _profile_has_kanban_toolset()
 
 
@@ -89,7 +155,24 @@ def _check_kanban_orchestrator_mode() -> bool:
     and are NOT scoped to a single task are the orchestrator surface.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
-        return False
+        role = _explicit_dispatched_role()
+        return role == "orchestrator"
+    return _profile_has_kanban_toolset()
+
+
+def _check_kanban_routing_mode() -> bool:
+    """Routing tools are explicit-orchestrator only for hardened dispatches."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        role = _explicit_dispatched_role()
+        return role is None or role == "orchestrator"
+    return _profile_has_kanban_toolset()
+
+
+def _check_kanban_artifact_write_mode() -> bool:
+    """Reviewers may inspect attachments but may not upload/replace evidence."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        role = _explicit_dispatched_role()
+        return role is None or role in {"worker", "orchestrator"}
     return _profile_has_kanban_toolset()
 
 
@@ -324,11 +407,14 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     structured tool_error so the model gets a clear refusal instead of
     silently mutating board state from a worker context.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    denied = _require_kanban_capability(tool_name)
+    if denied:
+        return denied
+    if os.environ.get("HERMES_KANBAN_TASK") and _explicit_dispatched_role() is None:
+        # Legacy dispatcher env: preserve the historical list/unblock denial.
         return tool_error(
-            f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
-            "must use kanban_complete, kanban_block, kanban_heartbeat, or "
-            "kanban_comment for their assigned task."
+            f"{tool_name} is orchestrator-only; legacy dispatcher-spawned "
+            "workers cannot use it"
         )
     return None
 
@@ -1925,7 +2011,7 @@ registry.register(
     name="kanban_show",
     toolset="kanban",
     schema=KANBAN_SHOW_SCHEMA,
-    handler=_handle_show,
+    handler=_guarded_handler("kanban_show", _handle_show),
     check_fn=_check_kanban_mode,
     emoji="📋",
 )
@@ -1934,7 +2020,7 @@ registry.register(
     name="kanban_list",
     toolset="kanban",
     schema=KANBAN_LIST_SCHEMA,
-    handler=_handle_list,
+    handler=_guarded_handler("kanban_list", _handle_list),
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
 )
@@ -1943,7 +2029,7 @@ registry.register(
     name="kanban_complete",
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
-    handler=_handle_complete,
+    handler=_guarded_handler("kanban_complete", _handle_complete),
     check_fn=_check_kanban_mode,
     emoji="✔",
 )
@@ -1952,7 +2038,7 @@ registry.register(
     name="kanban_block",
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
-    handler=_handle_block,
+    handler=_guarded_handler("kanban_block", _handle_block),
     check_fn=_check_kanban_mode,
     emoji="⏸",
 )
@@ -1961,7 +2047,7 @@ registry.register(
     name="kanban_heartbeat",
     toolset="kanban",
     schema=KANBAN_HEARTBEAT_SCHEMA,
-    handler=_handle_heartbeat,
+    handler=_guarded_handler("kanban_heartbeat", _handle_heartbeat),
     check_fn=_check_kanban_mode,
     emoji="💓",
 )
@@ -1970,7 +2056,7 @@ registry.register(
     name="kanban_comment",
     toolset="kanban",
     schema=KANBAN_COMMENT_SCHEMA,
-    handler=_handle_comment,
+    handler=_guarded_handler("kanban_comment", _handle_comment),
     check_fn=_check_kanban_mode,
     emoji="💬",
 )
@@ -1979,8 +2065,8 @@ registry.register(
     name="kanban_attach",
     toolset="kanban",
     schema=KANBAN_ATTACH_SCHEMA,
-    handler=_handle_attach,
-    check_fn=_check_kanban_mode,
+    handler=_guarded_handler("kanban_attach", _handle_attach),
+    check_fn=_check_kanban_artifact_write_mode,
     emoji="📎",
 )
 
@@ -1988,8 +2074,8 @@ registry.register(
     name="kanban_attach_url",
     toolset="kanban",
     schema=KANBAN_ATTACH_URL_SCHEMA,
-    handler=_handle_attach_url,
-    check_fn=_check_kanban_mode,
+    handler=_guarded_handler("kanban_attach_url", _handle_attach_url),
+    check_fn=_check_kanban_artifact_write_mode,
     emoji="📎",
 )
 
@@ -1997,7 +2083,7 @@ registry.register(
     name="kanban_attachments",
     toolset="kanban",
     schema=KANBAN_ATTACHMENTS_SCHEMA,
-    handler=_handle_attachments,
+    handler=_guarded_handler("kanban_attachments", _handle_attachments),
     check_fn=_check_kanban_mode,
     emoji="📎",
 )
@@ -2006,8 +2092,8 @@ registry.register(
     name="kanban_create",
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
-    handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    handler=_guarded_handler("kanban_create", _handle_create),
+    check_fn=_check_kanban_routing_mode,
     emoji="➕",
 )
 
@@ -2015,7 +2101,7 @@ registry.register(
     name="kanban_unblock",
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
-    handler=_handle_unblock,
+    handler=_guarded_handler("kanban_unblock", _handle_unblock),
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
 )
@@ -2024,7 +2110,7 @@ registry.register(
     name="kanban_link",
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
-    handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    handler=_guarded_handler("kanban_link", _handle_link),
+    check_fn=_check_kanban_routing_mode,
     emoji="🔗",
 )
