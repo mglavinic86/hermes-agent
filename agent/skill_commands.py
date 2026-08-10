@@ -286,7 +286,7 @@ def _build_skill_message(
     # Done before anything else so downstream blocks (setup notes,
     # supporting-file hints) see the expanded content.
     skills_cfg = _load_skills_config()
-    if skills_cfg.get("template_vars", True):
+    if skills_cfg.get("template_vars", True) and not pinned_snapshot_verified:
         content = _substitute_template_vars(content, skill_dir, session_id)
     if (
         skills_cfg.get("inline_shell", False)
@@ -346,7 +346,7 @@ def _build_skill_message(
         if isinstance(entries, list):
             supporting.extend(entries)
 
-    if not supporting and skill_dir:
+    if not supporting and skill_dir and not pinned_snapshot_verified:
         for subdir in ("references", "templates", "scripts", "assets"):
             subdir_path = skill_dir / subdir
             if subdir_path.exists():

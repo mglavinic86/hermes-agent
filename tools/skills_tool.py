@@ -1650,6 +1650,7 @@ def skill_view(
                 preprocessing_config = None
                 if pinned_snapshot is not None:
                     preprocessing_config = dict(load_skills_config())
+                    preprocessing_config["template_vars"] = False
                     preprocessing_config["inline_shell"] = False
 
                 rendered_content = preprocess_skill_content(

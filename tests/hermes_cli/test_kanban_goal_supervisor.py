@@ -1796,6 +1796,7 @@ def test_pinned_reviewer_disables_inline_shell_after_snapshot_verification(
         "---\nname: immutable-change-reviews\n---\n"
         "# Immutable Review\n"
         "Verified literal: !`cat SKILL.md`\n"
+        "Verified directory token: ${HERMES_SKILL_DIR}\n"
     )
     _skill_dir, _expected_digest, child_env = (
         _dispatch_pinned_reviewer_and_capture_child_env(
@@ -1837,6 +1838,7 @@ def test_pinned_reviewer_disables_inline_shell_after_snapshot_verification(
     assert loaded == ["immutable-change-reviews"]
     assert missing == []
     assert "Verified literal: !`cat SKILL.md`" in prompt
+    assert "Verified directory token: ${HERMES_SKILL_DIR}" in prompt
     assert "MUTATED_UNCHECKED_BODY" not in prompt
     assert "dispatcher-verified snapshot" in prompt
     assert str(_skill_dir) not in prompt
@@ -1845,6 +1847,7 @@ def test_pinned_reviewer_disables_inline_shell_after_snapshot_verification(
     viewed = json.loads(skill_view("immutable-change-reviews", preprocess=True))
     assert viewed["success"] is True
     assert "Verified literal: !`cat SKILL.md`" in viewed["content"]
+    assert "Verified directory token: ${HERMES_SKILL_DIR}" in viewed["content"]
     assert "MUTATED_UNCHECKED_BODY" not in viewed["content"]
     assert shell_calls == []
 
