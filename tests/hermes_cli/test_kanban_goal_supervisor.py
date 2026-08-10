@@ -1706,6 +1706,78 @@ def test_pinned_reviewer_skill_mutation_after_preload_fails_linked_read(
     assert "digest" in linked["error"].lower()
 
 
+def test_pinned_reviewer_consumes_snapshot_not_reversible_read_text_bytes(
+    kanban_home, monkeypatch
+):
+    """Consumer-only read_text substitution cannot bypass pinned-byte verification."""
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from tools.skills_tool import skill_view
+
+    skill_dir, _expected_digest, child_env = (
+        _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch)
+    )
+    reference = skill_dir / "references" / "rules.md"
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+
+    original_read_text = Path.read_text
+
+    def reversible_consumer_bytes(path, *args, **kwargs):
+        if path == skill_dir / "SKILL.md":
+            return "---\nname: immutable-change-reviews\n---\nMUTATED_UNCHECKED_BODY\n"
+        if path == reference:
+            return "MUTATED_UNCHECKED_REFERENCE"
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", reversible_consumer_bytes)
+
+    prompt, loaded, missing = build_preloaded_skills_prompt(
+        ["immutable-change-reviews"]
+    )
+    assert loaded == ["immutable-change-reviews"]
+    assert missing == []
+    assert "MUTATED_UNCHECKED_BODY" not in prompt
+
+    response = json.loads(
+        skill_view("immutable-change-reviews", file_path="references/rules.md")
+    )
+    assert response["success"] is True
+    assert response["content"] == "review exact immutable changes\n"
+    assert "MUTATED_UNCHECKED_REFERENCE" not in response["content"]
+
+
+def test_pinned_reviewer_rejects_mutated_verified_snapshot_bytes(
+    kanban_home, monkeypatch
+):
+    """The exact byte map handed to consumers must itself match the pinned digest."""
+    from agent import skill_integrity
+    from agent.skill_commands import build_preloaded_skills_prompt
+
+    skill_dir, _expected_digest, child_env = (
+        _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch)
+    )
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+
+    original_snapshot = skill_integrity._read_skill_tree_snapshot
+
+    def poisoned_snapshot(path):
+        snapshot = original_snapshot(path)
+        if snapshot is not None and path.resolve() == skill_dir.resolve():
+            snapshot = dict(snapshot)
+            snapshot["SKILL.md"] += b"\nMUTATED_UNCHECKED_BODY\n"
+        return snapshot
+
+    monkeypatch.setattr(skill_integrity, "_read_skill_tree_snapshot", poisoned_snapshot)
+
+    prompt, loaded, missing = build_preloaded_skills_prompt(
+        ["immutable-change-reviews"]
+    )
+    assert prompt == ""
+    assert loaded == []
+    assert missing == ["immutable-change-reviews"]
+
+
 def test_durable_review_without_pinned_digest_never_spawns(
     kanban_home, monkeypatch
 ):

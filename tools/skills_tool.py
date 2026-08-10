@@ -86,6 +86,7 @@ from agent.skill_utils import (
 )
 from agent.skill_integrity import (
     pinned_skill_digests_from_env,
+    read_verified_pinned_skill_snapshot,
     verify_pinned_skill_tree,
 )
 
@@ -1255,10 +1256,10 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        integrity_error = _pinned_skill_integrity_error(
+        pinned_snapshot, integrity_error = read_verified_pinned_skill_snapshot(
             name,
             skill_dir,
-            active_skills_dir,
+            skills_root=active_skills_dir,
         )
         if integrity_error:
             return json.dumps(
@@ -1266,9 +1267,14 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Read the file once — reused for platform check and main content below
+        # Pinned skills are consumed exclusively from the exact byte snapshot
+        # whose digest was verified above. Ordinary skills retain the legacy
+        # filesystem read path.
         try:
-            content = skill_md.read_text(encoding="utf-8")
+            if pinned_snapshot is not None:
+                content = pinned_snapshot["SKILL.md"].decode("utf-8")
+            else:
+                content = skill_md.read_text(encoding="utf-8")
         except Exception as e:
             return json.dumps(
                 {
@@ -1411,9 +1417,22 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-            # Read the file content
             try:
-                content = target_file.read_text(encoding="utf-8")
+                snapshot_key = target_file.relative_to(skill_dir).as_posix()
+            except ValueError:
+                snapshot_key = ""
+
+            # Read pinned content from the verified byte snapshot, never from a
+            # second mutable filesystem read.
+            raw_content: bytes | None = None
+            try:
+                if pinned_snapshot is not None:
+                    raw_content = pinned_snapshot.get(snapshot_key)
+                    if raw_content is None:
+                        raise FileNotFoundError(snapshot_key)
+                    content = raw_content.decode("utf-8")
+                else:
+                    content = target_file.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
                 integrity_error = _pinned_skill_integrity_error(
@@ -1426,12 +1445,17 @@ def skill_view(
                         {"success": False, "error": integrity_error},
                         ensure_ascii=False,
                     )
+                binary_size = (
+                    len(raw_content)
+                    if raw_content is not None
+                    else target_file.stat().st_size
+                )
                 return json.dumps(
                     {
                         "success": True,
                         "name": name,
                         "file": file_path,
-                        "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
+                        "content": f"[Binary file: {target_file.name}, size: {binary_size} bytes]",
                         "is_binary": True,
                     },
                     ensure_ascii=False,
