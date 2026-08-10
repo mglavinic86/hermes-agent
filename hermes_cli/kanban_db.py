@@ -7524,6 +7524,17 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def task_has_durable_goal_binding(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether a task is immutable durable-goal history."""
+    return conn.execute(
+        "SELECT 1 FROM kanban_goal_tasks WHERE task_id = ? LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and cascade to all related rows.
 
@@ -7535,6 +7546,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        if task_has_durable_goal_binding(conn, task_id):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

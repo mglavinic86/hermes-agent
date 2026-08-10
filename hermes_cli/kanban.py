@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import psutil
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
@@ -2146,6 +2148,27 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
     return parsed if parsed > 0 else 0
 
 
+def _called_from_active_kanban_worker(conn) -> bool:
+    """Detect worker ancestry independently of removable environment scope."""
+    rows = conn.execute(
+        "SELECT worker_pid FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    active_worker_pids = {
+        int(row["worker_pid"])
+        for row in rows
+        if row["worker_pid"] is not None and int(row["worker_pid"]) > 0
+    }
+    if not active_worker_pids:
+        return False
+    try:
+        process = psutil.Process(os.getpid())
+        process_tree = {process.pid, *(parent.pid for parent in process.parents())}
+    except (psutil.Error, OSError):
+        return True
+    return bool(active_worker_pids & process_tree)
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2427,6 +2450,12 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         return 1
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        if _called_from_active_kanban_worker(conn):
+            print(
+                "kanban: worker process trees cannot archive or purge tasks",
+                file=sys.stderr,
+            )
+            return 1
         if purge_ids:
             for tid in purge_ids:
                 if not kb.delete_archived_task(conn, tid):

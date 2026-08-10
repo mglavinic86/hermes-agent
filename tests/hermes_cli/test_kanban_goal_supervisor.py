@@ -658,6 +658,16 @@ def test_dispatcher_scoped_worker_cannot_archive_own_or_foreign_task(
         foreign_task = kb.claim_task(conn, foreign.task_id, claimer="builder")
         assert own_task is not None and own_task.current_run_id is not None
         assert foreign_task is not None
+        ordinary_foreign_id = _create_legacy_ready_task(
+            conn,
+            title="ordinary foreign task",
+            assignee="builder",
+        )
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+            (os.getpid(), own.task_id),
+        )
+        conn.commit()
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", own.task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(own_task.current_run_id))
@@ -670,12 +680,46 @@ def test_dispatcher_scoped_worker_cannot_archive_own_or_foreign_task(
     monkeypatch.delenv("HERMES_KANBAN_TASK")
     monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
     assert _cmd_archive(Namespace(task_ids=[own.task_id], purge_ids=[])) == 1
+    assert _cmd_archive(Namespace(task_ids=[ordinary_foreign_id], purge_ids=[])) == 1
 
     with kb.connect() as conn:
         own_after = kb.get_task(conn, own.task_id)
         foreign_after = kb.get_task(conn, foreign.task_id)
         assert own_after is not None and own_after.status == "running"
         assert foreign_after is not None and foreign_after.status == "running"
+        ordinary_after = kb.get_task(conn, ordinary_foreign_id)
+        assert ordinary_after is not None and ordinary_after.status == "ready"
+
+
+def test_durable_task_hard_delete_is_controlled_and_non_mutating(
+    kanban_home, monkeypatch
+):
+    from fastapi import HTTPException
+    from hermes_cli import profiles
+    from plugins.kanban.dashboard.plugin_api import delete_task as dashboard_delete_task
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    with kb.connect() as conn:
+        created = create_durable_goal(
+            conn,
+            objective="Preserve durable audit history",
+            origin=GoalOrigin(platform="telegram", chat_id="owner-chat"),
+            board="default",
+            builder_profile="builder",
+            verifier_profile="verifier",
+            reviewer_profile="reviewer",
+            repair_budget=1,
+            review_retry_budget=1,
+        )
+        assert not kb.delete_task(conn, created.task_id)
+        assert kb.get_task(conn, created.task_id) is not None
+
+    with pytest.raises(HTTPException) as exc_info:
+        dashboard_delete_task(created.task_id, board="default")
+    assert exc_info.value.status_code == 409
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, created.task_id) is not None
 
 
 def test_structured_build_completion_binds_current_run_and_creates_verify(

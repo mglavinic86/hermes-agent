@@ -980,6 +980,11 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        if kanban_db.task_has_durable_goal_binding(conn, task_id):
+            raise HTTPException(
+                status_code=409,
+                detail="durable-goal tasks cannot be hard-deleted",
+            )
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
