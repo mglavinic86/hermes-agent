@@ -1,0 +1,28 @@
+manifest_version: 1
+profile_logical_name: turpi_review
+skill_name: immutable-change-reviews
+source:
+  logical_root: immutable-change-reviews
+  require_root_skill_md: true
+  require_frontmatter_name: immutable-change-reviews
+snapshot:
+  destination_relative_root: skills/immutable-change-reviews
+  copy_all_regular_files: true
+  reject_symlinks: true
+  reject_hardlinks: true
+  reject_special_files: true
+  reject_path_escape: true
+  reject_credentials_and_git_metadata: true
+  live_inheritance: forbidden
+digest:
+  contract: turpi-skill-snapshot-v1
+  algorithm: sha256
+  path_encoding: utf-8
+  path_separator: /
+  ordering: raw-utf8-relative-path-bytes
+  length_framing: unsigned-64-bit-big-endian
+  content: raw-file-bytes
+  expected_tree_sha256: REQUIRED_64_LOWERCASE_HEX
+promotion:
+  live_profile_mutation: forbidden
+  owner_approval_required: true

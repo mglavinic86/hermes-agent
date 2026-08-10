@@ -1,0 +1,50 @@
+manifest_version: 1
+profile_logical_name: turpi_review
+skill_name: immutable-change-reviews
+source:
+  logical_root: immutable-change-reviews
+  require_root_skill_md: true
+  require_frontmatter_name: immutable-change-reviews
+  validated_file_count: 6
+snapshot:
+  destination_relative_root: skills/immutable-change-reviews
+  copy_all_regular_files: true
+  reject_symlinks: true
+  reject_hardlinks: true
+  reject_special_files: true
+  reject_path_escape: true
+  reject_credentials_and_git_metadata: true
+  live_inheritance: forbidden
+digest:
+  contract: turpi-skill-snapshot-v1
+  algorithm: sha256
+  path_encoding: utf-8
+  path_separator: /
+  ordering: raw-utf8-relative-path-bytes
+  length_framing: unsigned-64-bit-big-endian
+  content: raw-file-bytes
+  expected_tree_sha256: 1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1
+files:
+  - path: SKILL.md
+    bytes: 12460
+    sha256: 866d69f0a9af8467df36619091cf35d8c6cb43ea90a45fd4b9a9f54390ec326b
+  - path: references/capability-boundary-lifecycle-probes.md
+    bytes: 6130
+    sha256: 9c3000893a85f5c4e98957562394f150c188c15e2e6bd3f8a4310940529b93ab
+  - path: references/differential-red-ci-reviews.md
+    bytes: 3297
+    sha256: a78516b7c15f9eb5126de7a0b4a8367283b704634df6e01e59428af65b72b9c9
+  - path: references/exact-net-delta-promotion-reviews.md
+    bytes: 3591
+    sha256: 309c0bad5436b1a88ffacca0b40aea1ec4c2293a51823bb6b1b5f8493c05f8fb
+  - path: references/exact-sha-read-only-pr-review.md
+    bytes: 3056
+    sha256: cbd5f01c4855b41db303a1c00815169ea45f66535bbd6e859b202e744e81eefd
+  - path: references/governance-contract-evidence.md
+    bytes: 2703
+    sha256: 5f6e8b611bd0ca0128324c49a2e1d060ee5035581d5375ac01f6171ba2278d12
+promotion:
+  live_profile_mutation: forbidden
+  owner_approval_required: true
+  source_and_staging_digest_must_match: true
+  install_mode: regular-files-only

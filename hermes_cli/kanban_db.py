@@ -1384,6 +1384,88 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Deterministic, opt-in goal supervision. These rows are additive and do not
+-- change the lifecycle of ordinary Kanban tasks.
+CREATE TABLE IF NOT EXISTS kanban_goals (
+    id                       TEXT PRIMARY KEY,
+    objective                TEXT NOT NULL,
+    status                   TEXT NOT NULL,
+    current_stage            TEXT NOT NULL,
+    schema_version           INTEGER NOT NULL,
+    protocol_version         INTEGER NOT NULL,
+    board_slug               TEXT NOT NULL,
+    origin_platform          TEXT NOT NULL,
+    origin_chat_id           TEXT NOT NULL,
+    origin_chat_type         TEXT,
+    origin_thread_id         TEXT NOT NULL DEFAULT '',
+    origin_user_id           TEXT,
+    origin_message_id        TEXT,
+    notifier_profile         TEXT,
+    delivery_metadata        TEXT,
+    builder_profile          TEXT NOT NULL,
+    verifier_profile         TEXT NOT NULL,
+    reviewer_profile         TEXT NOT NULL,
+    reviewer_skill_digest    TEXT,
+    repair_budget            INTEGER NOT NULL,
+    repair_attempts_reserved INTEGER NOT NULL DEFAULT 0,
+    review_retry_budget      INTEGER NOT NULL,
+    review_attempts_reserved INTEGER NOT NULL DEFAULT 0,
+    candidate_sha            TEXT,
+    blocked_reason           TEXT,
+    state_version            INTEGER NOT NULL DEFAULT 1,
+    created_at               INTEGER NOT NULL,
+    updated_at               INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kanban_goal_tasks (
+    goal_id                TEXT NOT NULL,
+    task_id                TEXT NOT NULL UNIQUE,
+    stage                  TEXT NOT NULL,
+    attempt                INTEGER NOT NULL,
+    expected_run_id        INTEGER,
+    expected_candidate_sha TEXT,
+    completion_event_id    INTEGER,
+    completion_payload     TEXT,
+    created_at             INTEGER NOT NULL,
+    PRIMARY KEY (goal_id, stage, attempt),
+    FOREIGN KEY (goal_id) REFERENCES kanban_goals(id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_goal_notification_outbox (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id           TEXT NOT NULL,
+    kind              TEXT NOT NULL,
+    dedupe_key        TEXT NOT NULL UNIQUE,
+    payload           TEXT NOT NULL,
+    platform          TEXT NOT NULL,
+    chat_id           TEXT NOT NULL,
+    chat_type         TEXT,
+    thread_id         TEXT NOT NULL DEFAULT '',
+    user_id           TEXT,
+    notifier_profile  TEXT,
+    delivery_metadata TEXT,
+    claimed_at        INTEGER,
+    claim_token       TEXT,
+    delivered_at      INTEGER,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    created_at        INTEGER NOT NULL,
+    FOREIGN KEY (goal_id) REFERENCES kanban_goals(id)
+);
+
+-- Compatibility heartbeat owned by the machine-wide singleton dispatcher.
+-- No profile identity participates: a creator only trusts an exact, fresh
+-- schema/protocol lease written by the runtime that holds dispatch authority.
+CREATE TABLE IF NOT EXISTS kanban_goal_runtime (
+    singleton_id     INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    runtime_id       TEXT NOT NULL,
+    schema_version   INTEGER NOT NULL,
+    protocol_version INTEGER NOT NULL,
+    heartbeat_at     INTEGER NOT NULL,
+    lease_expires_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1394,6 +1476,13 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_goal_status           ON kanban_goals(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_goal_tasks_goal       ON kanban_goal_tasks(goal_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_goal_outbox_pending
+    ON kanban_goal_notification_outbox(delivered_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_origin_message
+    ON kanban_goals(origin_platform, origin_chat_id, origin_message_id)
+    WHERE origin_message_id IS NOT NULL AND origin_message_id != '';
 """
 
 
@@ -2547,6 +2636,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
 
+    goals_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_goals'"
+    ).fetchone() is not None
+    if goals_table_exists:
+        goal_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(kanban_goals)")
+        }
+        if "reviewer_skill_digest" not in goal_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_goals",
+                "reviewer_skill_digest",
+                "reviewer_skill_digest TEXT",
+            )
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -2877,6 +2981,897 @@ def _new_task_id() -> str:
     :func:`create_task` rather than rely on id uniqueness.
     """
     return "t_" + secrets.token_hex(4)
+
+
+def _new_goal_id() -> str:
+    """Return a collision-resistant id for an opt-in durable goal."""
+    return "g_" + secrets.token_hex(8)
+
+
+def create_durable_goal_record(
+    conn: sqlite3.Connection,
+    *,
+    objective: str,
+    board_slug: str,
+    origin: Mapping[str, Any],
+    builder_profile: str,
+    verifier_profile: str,
+    reviewer_profile: str,
+    reviewer_skill_digest: Optional[str] = None,
+    repair_budget: int,
+    review_retry_budget: int,
+    schema_version: int,
+    protocol_version: int,
+) -> tuple[str, str]:
+    """Atomically persist a durable goal and its initial BUILD task.
+
+    This is deliberately a narrow DB primitive. Stage interpretation lives in
+    :mod:`hermes_cli.kanban_goal_supervisor`; the database layer only guarantees
+    that a gateway-origin row and its ordinary Kanban task appear together.
+    """
+    objective = str(objective or "").strip()
+    if not objective:
+        raise ValueError("durable goal objective is required")
+    required_profiles = {
+        "builder_profile": str(builder_profile or "").strip(),
+        "verifier_profile": str(verifier_profile or "").strip(),
+        "reviewer_profile": str(reviewer_profile or "").strip(),
+    }
+    for name, value in required_profiles.items():
+        if not value:
+            raise ValueError(f"{name} is required")
+    reviewer_skill_digest = str(reviewer_skill_digest or "").strip() or None
+    if reviewer_skill_digest is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", reviewer_skill_digest
+    ):
+        raise ValueError("reviewer_skill_digest must be lowercase 64-hex")
+    platform = str(origin.get("platform") or "").strip().lower()
+    chat_id = str(origin.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        raise ValueError("durable goals require a gateway platform and chat_id")
+    try:
+        repair_limit = int(repair_budget)
+        review_limit = int(review_retry_budget)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("durable goal budgets must be integers") from exc
+    if repair_limit < 0 or review_limit < 0:
+        raise ValueError("durable goal budgets must be non-negative")
+
+    message_id = str(origin.get("message_id") or "").strip() or None
+    if message_id:
+        existing = conn.execute(
+            "SELECT id FROM kanban_goals "
+            "WHERE origin_platform = ? AND origin_chat_id = ? "
+            "AND origin_message_id = ?",
+            (platform, chat_id, message_id),
+        ).fetchone()
+        if existing:
+            binding = conn.execute(
+                "SELECT task_id FROM kanban_goal_tasks "
+                "WHERE goal_id = ? AND stage = 'BUILD' AND attempt = 0",
+                (existing["id"],),
+            ).fetchone()
+            if binding:
+                return str(existing["id"]), str(binding["task_id"])
+
+    now = int(time.time())
+    goal_id = _new_goal_id()
+    task_id = _new_task_id()
+    delivery_metadata = origin.get("delivery_metadata")
+    metadata_json = (
+        json.dumps(delivery_metadata, sort_keys=True, separators=(",", ":"))
+        if isinstance(delivery_metadata, Mapping) and delivery_metadata
+        else None
+    )
+    build_body = (
+        f"Durable goal: {objective}\n\n"
+        "Stage: BUILD. Produce a candidate commit, but do not merge, push, "
+        "or deploy. Complete with kanban_complete metadata.durable_goal using "
+        "structured protocol fields for stage, run_id, and candidate_sha."
+    )
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO kanban_goals (
+                id, objective, status, current_stage,
+                schema_version, protocol_version, board_slug,
+                origin_platform, origin_chat_id, origin_chat_type,
+                origin_thread_id, origin_user_id, origin_message_id,
+                notifier_profile, delivery_metadata,
+                builder_profile, verifier_profile, reviewer_profile,
+                reviewer_skill_digest,
+                repair_budget, review_retry_budget, created_at, updated_at
+            ) VALUES (?, ?, 'ACTIVE', 'BUILD', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                goal_id,
+                objective,
+                int(schema_version),
+                int(protocol_version),
+                str(board_slug or "").strip(),
+                platform,
+                chat_id,
+                str(origin.get("chat_type") or "").strip() or None,
+                str(origin.get("thread_id") or "").strip(),
+                str(origin.get("user_id") or "").strip() or None,
+                message_id,
+                str(origin.get("notifier_profile") or "").strip() or None,
+                metadata_json,
+                required_profiles["builder_profile"],
+                required_profiles["verifier_profile"],
+                required_profiles["reviewer_profile"],
+                reviewer_skill_digest,
+                repair_limit,
+                review_limit,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, title, body, assignee, status, priority,
+                created_by, created_at, workspace_kind, idempotency_key,
+                current_step_key
+            ) VALUES (?, ?, ?, ?, 'durable_ready', 0, ?, ?, 'worktree', ?, 'BUILD')
+            """,
+            (
+                task_id,
+                f"[Durable BUILD] {objective}"[:240],
+                build_body,
+                required_profiles["builder_profile"],
+                f"durable-goal:{goal_id}",
+                now,
+                f"durable-goal:{goal_id}:BUILD:0",
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "created",
+            {
+                "assignee": required_profiles["builder_profile"],
+                "status": "durable_ready",
+                "durable_goal_id": goal_id,
+                "stage": "BUILD",
+            },
+        )
+        conn.execute(
+            """
+            INSERT INTO kanban_goal_tasks
+                (goal_id, task_id, stage, attempt, created_at)
+            VALUES (?, ?, 'BUILD', 0, ?)
+            """,
+            (goal_id, task_id, now),
+        )
+    return goal_id, task_id
+
+
+def get_durable_goal_row(
+    conn: sqlite3.Connection, goal_id: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM kanban_goals WHERE id = ?", (goal_id,)
+    ).fetchone()
+
+
+def list_durable_goal_task_rows(
+    conn: sqlite3.Connection, goal_id: str
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM kanban_goal_tasks WHERE goal_id = ? "
+        "ORDER BY created_at, rowid",
+        (goal_id,),
+    ).fetchall()
+
+
+def transition_durable_goal_to_successor(
+    conn: sqlite3.Connection,
+    *,
+    goal_id: str,
+    expected_state_version: int,
+    predecessor_task_id: str,
+    completion_event_id: int,
+    expected_run_id: int,
+    next_stage: str,
+    next_attempt: int,
+    assignee: str,
+    reserve_budget: Optional[str] = None,
+    completion_payload: Optional[Mapping[str, Any]] = None,
+    candidate_sha: Optional[str] = None,
+    task_status: str = "ready",
+    skills: Optional[Iterable[str]] = None,
+) -> Optional[str]:
+    """CAS a supervised stage and create its successor in one transaction.
+
+    ``reserve_budget`` is either ``"repair"``, ``"review"``, or ``None``.
+    Reservation is committed in the same transaction as successor creation,
+    so a crash/replay can conservatively spend an attempt but can never mint a
+    successor without the corresponding sticky reservation.
+    """
+    if reserve_budget not in {None, "repair", "review"}:
+        raise ValueError("reserve_budget must be 'repair', 'review', or None")
+    try:
+        run_id = int(expected_run_id)
+        event_id = int(completion_event_id)
+        state_version = int(expected_state_version)
+        attempt = int(next_attempt)
+    except (TypeError, ValueError):
+        return None
+    if run_id < 1 or event_id < 1 or state_version < 1 or attempt < 0:
+        return None
+    next_stage = str(next_stage or "").strip()
+    assignee = _canonical_assignee(assignee)
+    if not next_stage or not assignee:
+        return None
+    if task_status not in {"ready", "review"}:
+        raise ValueError("durable successor task_status must be ready or review")
+    stored_task_status = (
+        "durable_review" if task_status == "review" else "durable_ready"
+    )
+    skills_list = [str(skill).strip() for skill in (skills or ()) if str(skill).strip()]
+
+    now = int(time.time())
+    successor_id = _new_task_id()
+    with write_txn(conn):
+        goal = conn.execute(
+            "SELECT * FROM kanban_goals WHERE id = ?",
+            (goal_id,),
+        ).fetchone()
+        if (
+            goal is None
+            or goal["status"] != "ACTIVE"
+            or int(goal["state_version"]) != state_version
+        ):
+            return None
+        predecessor = conn.execute(
+            "SELECT * FROM kanban_goal_tasks "
+            "WHERE goal_id = ? AND task_id = ?",
+            (goal_id, predecessor_task_id),
+        ).fetchone()
+        if predecessor is None:
+            return None
+        if predecessor["completion_event_id"] is not None:
+            existing = conn.execute(
+                "SELECT task_id FROM kanban_goal_tasks "
+                "WHERE goal_id = ? AND stage = ? AND attempt = ?",
+                (goal_id, next_stage, attempt),
+            ).fetchone()
+            return str(existing["task_id"]) if existing else None
+        event = conn.execute(
+            "SELECT task_id, run_id FROM task_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        if (
+            event is None
+            or event["task_id"] != predecessor_task_id
+            or event["run_id"] is None
+            or int(event["run_id"]) != run_id
+        ):
+            return None
+        if reserve_budget == "repair":
+            if int(goal["repair_attempts_reserved"]) >= int(goal["repair_budget"]):
+                return None
+            reservation_sql = (
+                "repair_attempts_reserved = repair_attempts_reserved + 1,"
+            )
+        elif reserve_budget == "review":
+            if int(goal["review_attempts_reserved"]) >= int(goal["review_retry_budget"]):
+                return None
+            reservation_sql = (
+                "review_attempts_reserved = review_attempts_reserved + 1,"
+            )
+        else:
+            reservation_sql = ""
+
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (predecessor_task_id,)
+        ).fetchone()
+        if task is None:
+            return None
+        body = (
+            f"Durable goal: {goal['objective']}\n\n"
+            f"Stage: {next_stage}. "
+            + (
+                f"Expected candidate SHA: {candidate_sha}. "
+                if candidate_sha
+                else ""
+            )
+            + "Continue only on the supervised candidate. "
+            "Do not merge, push, or deploy. Report completion through "
+            "kanban_complete with metadata.durable_goal structured fields."
+        )
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, title, body, assignee, status, priority,
+                created_by, created_at, workspace_kind, workspace_path,
+                branch_name, project_id, tenant, idempotency_key,
+                max_runtime_seconds, max_retries, current_step_key, skills
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                successor_id,
+                f"[Durable {next_stage}] {goal['objective']}"[:240],
+                body,
+                assignee,
+                stored_task_status,
+                int(task["priority"] or 0),
+                f"durable-goal:{goal_id}",
+                now,
+                task["workspace_kind"],
+                task["workspace_path"],
+                task["branch_name"],
+                task["project_id"],
+                task["tenant"],
+                f"durable-goal:{goal_id}:{next_stage}:{attempt}",
+                task["max_runtime_seconds"],
+                task["max_retries"],
+                next_stage,
+                json.dumps(skills_list) if skills_list else None,
+            ),
+        )
+        _append_event(
+            conn,
+            successor_id,
+            "created",
+            {
+                "assignee": assignee,
+                "status": stored_task_status,
+                "durable_goal_id": goal_id,
+                "stage": next_stage,
+                "skills": skills_list or None,
+            },
+        )
+        conn.execute(
+            """
+            INSERT INTO kanban_goal_tasks
+                (goal_id, task_id, stage, attempt,
+                 expected_candidate_sha, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (goal_id, successor_id, next_stage, attempt, candidate_sha, now),
+        )
+        predecessor_update = conn.execute(
+            "UPDATE kanban_goal_tasks "
+            "SET expected_run_id = ?, completion_event_id = ?, "
+            "completion_payload = ? "
+            "WHERE goal_id = ? AND task_id = ? "
+            "AND completion_event_id IS NULL",
+            (
+                run_id,
+                event_id,
+                (
+                    json.dumps(
+                        dict(completion_payload),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if isinstance(completion_payload, Mapping)
+                    else None
+                ),
+                goal_id,
+                predecessor_task_id,
+            ),
+        )
+        if predecessor_update.rowcount != 1:
+            raise RuntimeError("durable goal predecessor CAS failed")
+        goal_update = conn.execute(
+            f"UPDATE kanban_goals SET {reservation_sql} current_stage = ?, "
+            "candidate_sha = COALESCE(?, candidate_sha), "
+            "state_version = state_version + 1, updated_at = ? "
+            "WHERE id = ? AND status = 'ACTIVE' AND state_version = ?",
+            (next_stage, candidate_sha, now, goal_id, state_version),
+        )
+        if goal_update.rowcount != 1:
+            raise RuntimeError("durable goal state CAS failed")
+    return successor_id
+
+
+def transition_durable_goal_to_terminal(
+    conn: sqlite3.Connection,
+    *,
+    goal_id: str,
+    expected_state_version: int,
+    predecessor_task_id: str,
+    completion_event_id: int,
+    expected_run_id: int,
+    completion_payload: Mapping[str, Any],
+    terminal_status: str,
+    notification_kind: str,
+    notification_payload: Mapping[str, Any],
+    blocked_reason: Optional[str] = None,
+) -> bool:
+    """CAS a goal into a durable terminal/owner state and enqueue once."""
+    try:
+        state_version = int(expected_state_version)
+        event_id = int(completion_event_id)
+        run_id = int(expected_run_id)
+    except (TypeError, ValueError):
+        return False
+    if state_version < 1 or event_id < 1 or run_id < 1:
+        return False
+    terminal_status = str(terminal_status or "").strip()
+    notification_kind = str(notification_kind or "").strip()
+    if not terminal_status or not notification_kind:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        goal = conn.execute(
+            "SELECT * FROM kanban_goals WHERE id = ?", (goal_id,)
+        ).fetchone()
+        if (
+            goal is None
+            or goal["status"] != "ACTIVE"
+            or int(goal["state_version"]) != state_version
+        ):
+            return False
+        binding = conn.execute(
+            "SELECT completion_event_id FROM kanban_goal_tasks "
+            "WHERE goal_id = ? AND task_id = ?",
+            (goal_id, predecessor_task_id),
+        ).fetchone()
+        if binding is None or binding["completion_event_id"] is not None:
+            return False
+        event = conn.execute(
+            "SELECT task_id, run_id FROM task_events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if (
+            event is None
+            or event["task_id"] != predecessor_task_id
+            or event["run_id"] is None
+            or int(event["run_id"]) != run_id
+        ):
+            return False
+        updated_binding = conn.execute(
+            "UPDATE kanban_goal_tasks SET expected_run_id = ?, "
+            "completion_event_id = ?, completion_payload = ? "
+            "WHERE goal_id = ? AND task_id = ? AND completion_event_id IS NULL",
+            (
+                run_id,
+                event_id,
+                json.dumps(
+                    dict(completion_payload),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                goal_id,
+                predecessor_task_id,
+            ),
+        )
+        if updated_binding.rowcount != 1:
+            raise RuntimeError("durable goal terminal binding CAS failed")
+        updated_goal = conn.execute(
+            "UPDATE kanban_goals SET status = ?, current_stage = ?, "
+            "blocked_reason = ?, state_version = state_version + 1, "
+            "updated_at = ? WHERE id = ? AND status = 'ACTIVE' "
+            "AND state_version = ?",
+            (
+                terminal_status,
+                terminal_status,
+                blocked_reason,
+                now,
+                goal_id,
+                state_version,
+            ),
+        )
+        if updated_goal.rowcount != 1:
+            raise RuntimeError("durable goal terminal state CAS failed")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_goal_notification_outbox (
+                goal_id, kind, dedupe_key, payload,
+                platform, chat_id, chat_type, thread_id, user_id,
+                notifier_profile, delivery_metadata, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                goal_id,
+                notification_kind,
+                f"durable-goal:{goal_id}:{notification_kind}",
+                json.dumps(
+                    dict(notification_payload),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                goal["origin_platform"],
+                goal["origin_chat_id"],
+                goal["origin_chat_type"],
+                goal["origin_thread_id"],
+                goal["origin_user_id"],
+                goal["notifier_profile"],
+                goal["delivery_metadata"],
+                now,
+            ),
+        )
+    return True
+
+
+def complete_durable_goal_by_owner_record(
+    conn: sqlite3.Connection,
+    *,
+    goal_id: str,
+    expected_state_version: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    user_id: Optional[str],
+    candidate_sha: str,
+) -> bool:
+    """CAS READY_FOR_OWNER to COMPLETED from the exact persisted owner route."""
+    now = int(time.time())
+    with write_txn(conn):
+        goal = conn.execute(
+            "SELECT * FROM kanban_goals WHERE id = ?", (goal_id,)
+        ).fetchone()
+        expected_user_id = str(goal["origin_user_id"] or "") if goal else ""
+        if (
+            goal is None
+            or goal["status"] != "READY_FOR_OWNER"
+            or int(goal["state_version"]) != int(expected_state_version)
+            or str(goal["origin_platform"]) != str(platform)
+            or str(goal["origin_chat_id"]) != str(chat_id)
+            or str(goal["origin_thread_id"] or "") != str(thread_id or "")
+            or (expected_user_id and expected_user_id != str(user_id or ""))
+            or str(goal["candidate_sha"] or "") != str(candidate_sha)
+        ):
+            return False
+        updated = conn.execute(
+            "UPDATE kanban_goals SET status = 'COMPLETED', "
+            "current_stage = 'COMPLETED', state_version = state_version + 1, "
+            "updated_at = ? WHERE id = ? AND status = 'READY_FOR_OWNER' "
+            "AND state_version = ?",
+            (now, goal_id, int(expected_state_version)),
+        )
+        if updated.rowcount != 1:
+            return False
+        payload = {
+            "goal_id": goal_id,
+            "objective": goal["objective"],
+            "candidate_sha": candidate_sha,
+            "status": "COMPLETED",
+            "completion_authority": "owner",
+        }
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_goal_notification_outbox (
+                goal_id, kind, dedupe_key, payload,
+                platform, chat_id, chat_type, thread_id, user_id,
+                notifier_profile, delivery_metadata, created_at
+            ) VALUES (?, 'COMPLETED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                goal_id,
+                f"durable-goal:{goal_id}:COMPLETED",
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                goal["origin_platform"],
+                goal["origin_chat_id"],
+                goal["origin_chat_type"],
+                goal["origin_thread_id"],
+                goal["origin_user_id"],
+                goal["notifier_profile"],
+                goal["delivery_metadata"],
+                now,
+            ),
+        )
+    return True
+
+
+def list_durable_goal_notification_rows(
+    conn: sqlite3.Connection, goal_id: Optional[str] = None
+) -> list[sqlite3.Row]:
+    if goal_id is None:
+        return conn.execute(
+            "SELECT * FROM kanban_goal_notification_outbox ORDER BY id"
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM kanban_goal_notification_outbox "
+        "WHERE goal_id = ? ORDER BY id",
+        (goal_id,),
+    ).fetchall()
+
+
+def upsert_durable_goal_runtime(
+    conn: sqlite3.Connection,
+    *,
+    runtime_id: str,
+    schema_version: int,
+    protocol_version: int,
+    lease_seconds: int,
+    now: Optional[int] = None,
+) -> None:
+    """Record the exact singleton runtime compatibility lease for this board."""
+    runtime_id = str(runtime_id or "").strip()
+    if not runtime_id:
+        raise ValueError("durable goal runtime_id is required")
+    try:
+        schema = int(schema_version)
+        protocol = int(protocol_version)
+        lease = int(lease_seconds)
+        heartbeat = int(time.time()) if now is None else int(now)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("durable goal runtime lease values must be integers") from exc
+    if schema < 1 or protocol < 1 or lease < 1 or heartbeat < 0:
+        raise ValueError("durable goal runtime lease values must be positive")
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO kanban_goal_runtime (
+                singleton_id, runtime_id, schema_version, protocol_version,
+                heartbeat_at, lease_expires_at
+            ) VALUES (1, ?, ?, ?, ?, ?)
+            ON CONFLICT(singleton_id) DO UPDATE SET
+                runtime_id = excluded.runtime_id,
+                schema_version = excluded.schema_version,
+                protocol_version = excluded.protocol_version,
+                heartbeat_at = excluded.heartbeat_at,
+                lease_expires_at = excluded.lease_expires_at
+            """,
+            (runtime_id, schema, protocol, heartbeat, heartbeat + lease),
+        )
+
+
+def get_durable_goal_runtime_row(
+    conn: sqlite3.Connection,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM kanban_goal_runtime WHERE singleton_id = 1"
+    ).fetchone()
+
+
+def clear_durable_goal_runtime(
+    conn: sqlite3.Connection, *, runtime_id: str
+) -> bool:
+    """Release only the caller's runtime lease; stale owners cannot clear newer ones."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_goal_runtime WHERE singleton_id = 1 AND runtime_id = ?",
+            (str(runtime_id or "").strip(),),
+        )
+    return cur.rowcount == 1
+
+
+DURABLE_GOAL_NOTIFICATION_CLAIM_TIMEOUT_SECONDS = 120
+
+
+def claim_pending_durable_goal_notifications(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+    max_attempts: int = 12,
+    claim_timeout_seconds: int = DURABLE_GOAL_NOTIFICATION_CLAIM_TIMEOUT_SECONDS,
+    now: Optional[int] = None,
+) -> list[sqlite3.Row]:
+    """Reserve pending durable goal owner notifications for one delivery tick."""
+    current_time = int(time.time()) if now is None else int(now)
+    timeout = max(1, int(claim_timeout_seconds))
+    expired_before = current_time - timeout
+    claim_token = secrets.token_hex(16)
+    claimed: list[sqlite3.Row] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            """
+            SELECT *
+              FROM kanban_goal_notification_outbox
+             WHERE delivered_at IS NULL
+               AND (
+                    claim_token IS NULL
+                    OR COALESCE(claimed_at, 0) <= ?
+               )
+               AND delivery_attempts < ?
+             ORDER BY id
+             LIMIT ?
+            """,
+            (expired_before, int(max_attempts), int(limit)),
+        ).fetchall()
+        for row in rows:
+            updated = conn.execute(
+                """
+                UPDATE kanban_goal_notification_outbox
+                   SET claim_token = ?,
+                       claimed_at = ?,
+                       delivery_attempts = delivery_attempts + 1
+                 WHERE id = ?
+                   AND delivered_at IS NULL
+                   AND (
+                        claim_token IS NULL
+                        OR (
+                            claim_token = ?
+                            AND COALESCE(claimed_at, 0) <= ?
+                        )
+                   )
+                   AND delivery_attempts < ?
+                """,
+                (
+                    claim_token,
+                    current_time,
+                    int(row["id"]),
+                    str(row["claim_token"] or ""),
+                    expired_before,
+                    int(max_attempts),
+                ),
+            )
+            if updated.rowcount == 1:
+                refreshed = conn.execute(
+                    "SELECT * FROM kanban_goal_notification_outbox WHERE id = ?",
+                    (int(row["id"]),),
+                ).fetchone()
+                if refreshed is not None:
+                    claimed.append(refreshed)
+    return claimed
+
+
+def count_pending_durable_goal_notifications(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+    max_attempts: int = 12,
+    claim_timeout_seconds: int = DURABLE_GOAL_NOTIFICATION_CLAIM_TIMEOUT_SECONDS,
+    now: Optional[int] = None,
+) -> int:
+    """Count undelivered durable goal owner notifications via read-only DB open."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    if not path.exists():
+        return 0
+    current_time = int(time.time()) if now is None else int(now)
+    timeout = max(1, int(claim_timeout_seconds))
+    expired_before = current_time - timeout
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                  FROM kanban_goal_notification_outbox
+                 WHERE delivered_at IS NULL
+                   AND (
+                        claim_token IS NULL
+                        OR COALESCE(claimed_at, 0) <= ?
+                   )
+                   AND delivery_attempts < ?
+                """,
+                (expired_before, int(max_attempts)),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return 0
+            raise
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def mark_durable_goal_notification_delivered(
+    conn: sqlite3.Connection,
+    *,
+    notification_id: int,
+    claim_token: str,
+) -> bool:
+    now = int(time.time())
+    with write_txn(conn):
+        updated = conn.execute(
+            """
+            UPDATE kanban_goal_notification_outbox
+               SET delivered_at = ?,
+                   claim_token = NULL,
+                   claimed_at = NULL,
+                   last_error = NULL
+             WHERE id = ?
+               AND claim_token = ?
+               AND delivered_at IS NULL
+            """,
+            (now, int(notification_id), str(claim_token)),
+        )
+    return updated.rowcount == 1
+
+
+def release_durable_goal_notification_claim(
+    conn: sqlite3.Connection,
+    *,
+    notification_id: int,
+    claim_token: str,
+    error: str,
+) -> bool:
+    with write_txn(conn):
+        updated = conn.execute(
+            """
+            UPDATE kanban_goal_notification_outbox
+               SET claim_token = NULL,
+                   claimed_at = NULL,
+                   last_error = ?
+             WHERE id = ?
+               AND claim_token = ?
+               AND delivered_at IS NULL
+            """,
+            (str(error or "")[:500], int(notification_id), str(claim_token)),
+        )
+    return updated.rowcount == 1
+
+
+def block_durable_goal_capability(
+    conn: sqlite3.Connection,
+    *,
+    goal_id: str,
+    task_id: str,
+    expected_state_version: int,
+    reason: str,
+) -> bool:
+    """Fail closed before spawn and durably notify the originating owner."""
+    reason = str(reason or "").strip()
+    if not reason:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        goal = conn.execute(
+            "SELECT * FROM kanban_goals WHERE id = ?", (goal_id,)
+        ).fetchone()
+        if (
+            goal is None
+            or goal["status"] != "ACTIVE"
+            or int(goal["state_version"]) != int(expected_state_version)
+        ):
+            return False
+        binding = conn.execute(
+            "SELECT 1 FROM kanban_goal_tasks WHERE goal_id = ? AND task_id = ?",
+            (goal_id, task_id),
+        ).fetchone()
+        if binding is None:
+            return False
+        task_update = conn.execute(
+            "UPDATE tasks SET status = 'blocked', last_failure_error = ? "
+            "WHERE id = ? AND status IN "
+            "('durable_ready', 'durable_review') "
+            "AND current_run_id IS NULL AND claim_lock IS NULL",
+            (reason[:500], task_id),
+        )
+        if task_update.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {"reason": reason, "block_kind": "capability", "durable_goal_id": goal_id},
+        )
+        goal_update = conn.execute(
+            "UPDATE kanban_goals SET status = 'BLOCKED_CAPABILITY', "
+            "current_stage = 'BLOCKED_CAPABILITY', blocked_reason = ?, "
+            "state_version = state_version + 1, updated_at = ? "
+            "WHERE id = ? AND status = 'ACTIVE' AND state_version = ?",
+            (reason, now, goal_id, int(expected_state_version)),
+        )
+        if goal_update.rowcount != 1:
+            raise RuntimeError("durable capability block state CAS failed")
+        payload = {
+            "goal_id": goal_id,
+            "objective": goal["objective"],
+            "candidate_sha": goal["candidate_sha"],
+            "status": "BLOCKED_CAPABILITY",
+            "reason": reason,
+        }
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_goal_notification_outbox (
+                goal_id, kind, dedupe_key, payload,
+                platform, chat_id, chat_type, thread_id, user_id,
+                notifier_profile, delivery_metadata, created_at
+            ) VALUES (?, 'BLOCKED_CAPABILITY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                goal_id,
+                f"durable-goal:{goal_id}:BLOCKED_CAPABILITY",
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                goal["origin_platform"],
+                goal["origin_chat_id"],
+                goal["origin_chat_type"],
+                goal["origin_thread_id"],
+                goal["origin_user_id"],
+                goal["notifier_profile"],
+                goal["delivery_metadata"],
+                now,
+            ),
+        )
+    return True
 
 
 def _claimer_id() -> str:
@@ -4168,7 +5163,7 @@ def claim_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+    """Atomically transition ``ready`` or supervised ``durable_ready`` to running.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
@@ -4179,7 +5174,7 @@ def claim_task(
     with write_txn(conn):
         budget = conn.execute(
             "SELECT goal_mode, goal_max_turns, goal_turns_used "
-            "FROM tasks WHERE id = ? AND status = 'ready'",
+            "FROM tasks WHERE id = ? AND status IN ('ready', 'durable_ready')",
             (task_id,),
         ).fetchone()
         if budget and bool(budget["goal_mode"]):
@@ -4188,7 +5183,7 @@ def claim_task(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "last_failure_error = ? "
-                    "WHERE id = ? AND status = 'ready'",
+                    "WHERE id = ? AND status IN ('ready', 'durable_ready')",
                     ("cumulative goal turn budget exhausted", task_id),
                 )
                 payload = {
@@ -4219,7 +5214,7 @@ def claim_task(
         if undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
+                "WHERE id = ? AND status IN ('ready', 'durable_ready')",
                 (task_id,),
             )
             _append_event(
@@ -4232,7 +5227,8 @@ def claim_task(
         # it when the CAS resets the pointer below. No-op when the invariant
         # holds (the common case).
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
+            "SELECT current_run_id FROM tasks WHERE id = ? "
+            "AND status IN ('ready', 'durable_ready')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -4255,7 +5251,7 @@ def claim_task(
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'ready'
+               AND status IN ('ready', 'durable_ready')
                AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
@@ -4314,8 +5310,9 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    allow_durable: bool = False,
 ) -> Optional[Task]:
-    """Atomically transition ``review -> running``.
+    """Atomically transition a review task to running.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``review`` status).
@@ -4330,16 +5327,17 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    claimable_statuses = "('review', 'durable_review')" if allow_durable else "('review')"
     with write_txn(conn):
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'review'
+               AND status IN {claimable_statuses}
                AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
@@ -4580,12 +5578,13 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            requeue_status = _requeue_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (requeue_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -4652,12 +5651,13 @@ def reclaim_task(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
+        requeue_status = _requeue_status(conn, task_id)
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            (requeue_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
@@ -7294,13 +8294,14 @@ def enforce_max_runtime(
                     pass
 
         with write_txn(conn):
+            requeue_status = _requeue_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (tid, pid, row["claim_lock"]),
+                (requeue_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -7420,13 +8421,14 @@ def detect_stale_running(
             continue
 
         with write_txn(conn):
+            requeue_status = _requeue_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
+                (requeue_status, tid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -7678,12 +8680,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            requeue_status = _requeue_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (requeue_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -7891,6 +8894,7 @@ def _record_task_failure(
             return False
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
+        requeue_status = _requeue_status(conn, task_id)
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -7922,7 +8926,8 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN "
+                    "('ready', 'durable_ready', 'durable_review', 'running')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -7957,11 +8962,11 @@ def _record_task_failure(
             if release_claim:
                 # Spawn path: transition running → ready + clear claim.
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (requeue_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via
@@ -8241,6 +9246,18 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _requeue_status(conn: sqlite3.Connection, task_id: str) -> str:
+    """Keep supervised tasks outside the legacy dispatcher's visible queues."""
+    row = conn.execute(
+        "SELECT stage FROM kanban_goal_tasks WHERE task_id = ? LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return "ready"
+    stage = str(row["stage"] or "")
+    return "durable_review" if stage.startswith("REVIEW") else "durable_ready"
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -8254,6 +9271,8 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    durable_goal_protocol_version: Optional[int] = None,
+    durable_goal_skill_available=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8288,6 +9307,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            durable_goal_protocol_version=durable_goal_protocol_version,
+            durable_goal_skill_available=durable_goal_skill_available,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8304,6 +9325,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            durable_goal_protocol_version=durable_goal_protocol_version,
+            durable_goal_skill_available=durable_goal_skill_available,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -8324,6 +9347,8 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    durable_goal_protocol_version: Optional[int] = None,
+    durable_goal_skill_available=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8358,6 +9383,19 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    resolved_dispatch_board = _normalize_board_slug(board) or get_current_board()
+
+    def _durable_preflight(task_id: str):
+        from hermes_cli.kanban_goal_supervisor import preflight_durable_dispatch
+
+        return preflight_durable_dispatch(
+            conn,
+            task_id,
+            board=resolved_dispatch_board,
+            runtime_protocol_version=durable_goal_protocol_version,
+            skill_available=durable_goal_skill_available,
+        )
+
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
@@ -8398,8 +9436,8 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "SELECT id, assignee, skills FROM tasks "
+        "WHERE status IN ('ready', 'durable_ready') AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
@@ -8500,6 +9538,11 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        durable_preflight = _durable_preflight(row["id"])
+        if not durable_preflight.allowed:
+            if durable_preflight.blocked_now:
+                result.auto_blocked.append(row["id"])
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -8639,9 +9682,14 @@ def _dispatch_once_locked(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
+    review_status_filter = (
+        "status IN ('review', 'durable_review')"
+        if durable_goal_protocol_version is not None
+        else "status = 'review'"
+    )
     review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
+        "SELECT id, assignee, skills FROM tasks "
+        f"WHERE {review_status_filter} AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
@@ -8649,6 +9697,11 @@ def _dispatch_once_locked(
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        durable_preflight = _durable_preflight(row["id"])
+        if not durable_preflight.allowed:
+            if durable_preflight.blocked_now:
+                result.auto_blocked.append(row["id"])
             continue
         try:
             from hermes_cli.profiles import profile_exists
@@ -8660,7 +9713,12 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            allow_durable=durable_preflight.supervised,
+        )
         if claimed is None:
             continue
         try:
@@ -8687,7 +9745,8 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        if not durable_preflight.supervised:
+            claimed.skills = ["sdlc-review"]
         # Kernel-owned review queue: role provenance comes from the dispatch
         # transition, not from the assignee/task body/model. _default_spawn
         # stamps this trusted value into HERMES_KANBAN_ROLE.

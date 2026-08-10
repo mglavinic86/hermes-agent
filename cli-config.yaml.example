@@ -198,6 +198,25 @@ model:
 # worktree_sync: false  # Branch from local HEAD (offline / pinned base)
 
 # =============================================================================
+# Durable Kanban Goal Supervisor (explicit opt-in)
+# =============================================================================
+# `/goal durable <objective>` remains unavailable until every lock-eligible
+# gateway runs the matching supervisor protocol and the active dispatcher has
+# written a fresh compatibility lease. The board must have an absolute Git
+# `default_workdir`. Reviewer skills are profile-local snapshots: do not use
+# symlinks or live inheritance from another profile.
+#
+# kanban:
+#   durable_goals:
+#     board: turpi-v2
+#     builder_profile: turpi_builder
+#     verifier_profile: turpi_verify
+#     reviewer_profile: turpi_review
+#     reviewer_skill_digest: "1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1"
+#     repair_budget: 1
+#     review_retry_budget: 1
+
+# =============================================================================
 # Terminal Tool Configuration
 # =============================================================================
 # Choose ONE of the following terminal configurations by uncommenting it.
