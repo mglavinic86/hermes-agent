@@ -1120,6 +1120,30 @@ def skill_view(
         # Build list of all skill directories to search
         all_dirs = []
         active_skills_dir = _skills_dir()
+        pinned_digests = pinned_skill_digests_from_env()
+        if "*" in pinned_digests:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "malformed dispatcher-pinned skill digest map",
+                },
+                ensure_ascii=False,
+            )
+        durable_reviewer = (
+            name == "immutable-change-reviews"
+            and (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+            and (os.environ.get("HERMES_KANBAN_ROLE") or "").strip().lower()
+            == "reviewer"
+        )
+        if durable_reviewer and name not in pinned_digests:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "missing dispatcher-pinned reviewer skill digest",
+                },
+                ensure_ascii=False,
+            )
+        pinned_name = name if name in pinned_digests else None
         if active_skills_dir.exists():
             all_dirs.append(active_skills_dir)
         all_dirs.extend(get_external_skills_dirs())
@@ -1157,7 +1181,13 @@ def skill_view(
             seen_md.add(key)
             candidates.append((sd, smd))
 
-        for search_dir in all_dirs:
+        if pinned_name is not None:
+            pinned_dir = active_skills_dir / pinned_name
+            pinned_md = pinned_dir / "SKILL.md"
+            if pinned_dir.is_dir() and pinned_md.is_file():
+                _record(pinned_dir, pinned_md)
+
+        for search_dir in ([] if pinned_name is not None else all_dirs):
             # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
             # at the top of the dir).
             direct_path = search_dir / name
@@ -1243,6 +1273,15 @@ def skill_view(
 
         if candidates:
             skill_dir, skill_md = candidates[0]
+
+        if pinned_name is not None and not skill_md:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"pinned skill digest mismatch for {pinned_name}",
+                },
+                ensure_ascii=False,
+            )
 
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]

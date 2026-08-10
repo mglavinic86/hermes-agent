@@ -1919,6 +1919,57 @@ def test_pinned_reviewer_missing_file_inventory_uses_verified_snapshot(
     assert "LIVE_UNCHECKED_FILENAME" not in json.dumps(response)
 
 
+def test_pinned_reviewer_resolution_ignores_live_name_collisions(
+    kanban_home, monkeypatch
+):
+    """Pinned lookup must select only the exact profile-local pinned directory."""
+    from agent import skill_utils
+    from tools.skills_tool import skill_view
+
+    skill_dir, _expected_digest, child_env = (
+        _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch)
+    )
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+
+    initial = json.loads(skill_view("immutable-change-reviews"))
+    assert initial["success"] is True
+    assert initial["_pinned_snapshot_verified"] is True
+    expected_rules = (skill_dir / "references" / "rules.md").read_text(
+        encoding="utf-8"
+    )
+
+    collision_dir = (
+        kanban_home
+        / "profiles"
+        / "reviewer"
+        / "skills"
+        / "LIVE_UNCHECKED_PROMPT_MARKER"
+    )
+    collision_dir.mkdir(parents=True)
+    (collision_dir / "SKILL.md").write_text(
+        "---\nname: immutable-change-reviews\n---\nLIVE_UNCHECKED_COLLISION\n",
+        encoding="utf-8",
+    )
+
+    def forbidden_discovery(*_args, **_kwargs):
+        raise AssertionError("pinned skill lookup must not scan the mutable skill tree")
+
+    monkeypatch.setattr(skill_utils, "iter_skill_index_files", forbidden_discovery)
+
+    main = json.loads(skill_view("immutable-change-reviews"))
+    linked = json.loads(
+        skill_view("immutable-change-reviews", file_path="references/rules.md")
+    )
+    assert main["success"] is True
+    assert linked["success"] is True
+    assert linked["content"] == expected_rules
+    combined = json.dumps([main, linked])
+    assert "LIVE_UNCHECKED" not in combined
+    assert "Ambiguous skill name" not in combined
+    assert str(collision_dir) not in combined
+
+
 def test_durable_review_without_pinned_digest_never_spawns(
     kanban_home, monkeypatch
 ):
