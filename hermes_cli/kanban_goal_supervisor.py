@@ -452,7 +452,8 @@ def _validated_terminal_event(conn, binding: DurableGoalTask):
     """Return the newest terminal event only when its run is exact/current."""
     row = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? "
-        "AND kind IN ('completed', 'gave_up', 'blocked') "
+        "AND kind IN ('completed', 'gave_up', 'blocked', 'dependency_wait', "
+        "'block_loop_detected', 'scheduled') "
         "ORDER BY id DESC LIMIT 1",
         (binding.task_id,),
     ).fetchone()
@@ -584,6 +585,43 @@ def supervise_goal_once(
     event = _validated_terminal_event(conn, binding)
     if event is None:
         return SupervisionResult("NOOP", goal_id, task_id=binding.task_id)
+
+    if event["kind"] in {
+        "blocked",
+        "dependency_wait",
+        "block_loop_detected",
+        "scheduled",
+    }:
+        event_payload = _decode_object(event["payload"]) or {}
+        event_reason = str(event_payload.get("reason") or "").strip()
+        reason = f"durable task {event['kind']} during {binding.stage}"
+        if event_reason:
+            reason = f"{reason}: {event_reason}"
+        completion_payload = dict(event_payload)
+        completion_payload["event"] = str(event["kind"])
+        blocked = kb.transition_durable_goal_to_terminal(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            predecessor_task_id=binding.task_id,
+            completion_event_id=int(event["id"]),
+            expected_run_id=int(event["run_id"]),
+            completion_payload=completion_payload,
+            terminal_status="BLOCKED",
+            notification_kind="BLOCKED",
+            notification_payload={
+                "goal_id": goal.id,
+                "objective": goal.objective,
+                "candidate_sha": goal.candidate_sha,
+                "status": "BLOCKED",
+                "event": str(event["kind"]),
+                "reason": reason,
+            },
+            blocked_reason=reason,
+        )
+        if not blocked:
+            return SupervisionResult("NOOP", goal_id, reason="transition_lost")
+        return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
 
     if event["kind"] == "gave_up" and (
         binding.stage == "BUILD" or binding.stage.startswith("REPAIR_BUILD_")

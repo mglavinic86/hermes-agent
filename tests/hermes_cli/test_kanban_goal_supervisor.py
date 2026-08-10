@@ -397,6 +397,84 @@ def test_build_gave_up_reserves_one_repair_and_replay_creates_no_duplicate(
         assert repair.workspace_kind == "worktree"
 
 
+@pytest.mark.parametrize(
+    ("terminal_event", "block_kind"),
+    [
+        ("blocked", None),
+        ("dependency_wait", "dependency"),
+        ("block_loop_detected", "needs_input"),
+        ("scheduled", None),
+    ],
+)
+def test_current_run_park_or_block_terminates_goal_and_notifies_once(
+    kanban_home, monkeypatch, terminal_event, block_kind
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    with kb.connect() as conn:
+        created = create_durable_goal(
+            conn,
+            objective="Do not orphan a parked durable goal",
+            origin=GoalOrigin(platform="telegram", chat_id="owner-chat"),
+            board="default",
+            builder_profile="builder",
+            verifier_profile="verifier",
+            reviewer_profile="reviewer",
+            repair_budget=1,
+            review_retry_budget=1,
+        )
+        task = kb.claim_task(conn, created.task_id, claimer="builder")
+        assert task is not None and task.current_run_id is not None
+
+        if terminal_event == "scheduled":
+            assert kb.schedule_task(
+                conn,
+                task.id,
+                reason="wait for owner window",
+                expected_run_id=task.current_run_id,
+            )
+        else:
+            if terminal_event == "block_loop_detected":
+                conn.execute(
+                    "UPDATE tasks SET block_kind = ?, block_recurrences = ? "
+                    "WHERE id = ?",
+                    (block_kind, kb.BLOCK_RECURRENCE_LIMIT - 1, task.id),
+                )
+                conn.commit()
+            assert kb.block_task(
+                conn,
+                task.id,
+                reason="owner input required",
+                kind=block_kind,
+                expected_run_id=task.current_run_id,
+            )
+
+        first = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        bindings = list_durable_goal_tasks(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert first.action == "BLOCKED"
+    assert replay.action == "NOOP"
+    assert goal is not None and goal.status == "BLOCKED"
+    assert terminal_event in (goal.blocked_reason or "")
+    assert len(bindings) == 1 and bindings[0].completion_event_id is not None
+    assert [item.kind for item in notifications] == ["BLOCKED"]
+    assert notifications[0].payload["event"] == terminal_event
+
+
 def test_structured_build_completion_binds_current_run_and_creates_verify(
     kanban_home,
 ):

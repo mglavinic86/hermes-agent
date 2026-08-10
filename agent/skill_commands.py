@@ -265,7 +265,12 @@ def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None
         if not resolved:
             return
 
-        lines = ["", f"[Skill config (from {display_hermes_home()}/config.yaml):"]
+        config_source = (
+            "dispatcher profile config"
+            if loaded_skill.get("_pinned_snapshot_verified")
+            else f"{display_hermes_home()}/config.yaml"
+        )
+        lines = ["", f"[Skill config (from {config_source}):"]
         for key, value in resolved.items():
             display_val = str(value) if value else "(not set)"
             lines.append(f"  {key} = {display_val}")
