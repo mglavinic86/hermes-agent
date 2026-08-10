@@ -599,3 +599,164 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+
+@pytest.mark.parametrize(
+    "run_identity",
+    [None, "malformed", "0", "-1", "stale", "foreign"],
+)
+def test_cli_goal_complete_rejects_invalid_scoped_run_before_auxiliary_judge(
+    kanban_home, monkeypatch, run_identity
+):
+    import argparse
+    import json
+
+    from hermes_cli.kanban import _cmd_complete
+
+    monkeypatch.setenv("HERMES_PROFILE", "goal-worker")
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="scoped CLI goal",
+            body="Produce exact evidence.",
+            assignee="goal-worker",
+            goal_mode=True,
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="goal-worker")
+        assert claimed is not None and claimed.current_run_id is not None
+        current_run_id = claimed.current_run_id
+        workspace = kb.resolve_workspace(claimed)
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "cli-goal.txt"
+        artifact.write_text("must remain scratch-only", encoding="utf-8")
+
+        foreign_id = kb.create_task(conn, title="foreign CLI run", assignee="other")
+        foreign = kb.claim_task(conn, foreign_id, claimer="other")
+        assert foreign is not None and foreign.current_run_id is not None
+        foreign_run_id = foreign.current_run_id
+
+        before = (
+            tuple(conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()),
+            tuple(conn.execute(
+                "SELECT * FROM task_runs WHERE id = ?", (current_run_id,)
+            ).fetchone()),
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+        )
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    if run_identity is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    elif run_identity == "stale":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current_run_id + 100_000))
+    elif run_identity == "foreign":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(foreign_run_id))
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_identity)
+
+    auxiliary_calls: list[str] = []
+
+    def billable_availability_probe(_name):
+        auxiliary_calls.append("availability")
+        return object(), "judge-model"
+
+    def billable_judge(**_kwargs):
+        auxiliary_calls.append("judge")
+        return "done", "accepted", False, None, False
+
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        billable_availability_probe,
+    )
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", billable_judge)
+    args = argparse.Namespace(
+        task_ids=[task_id],
+        summary="claiming CLI goal completion",
+        result=None,
+        metadata=json.dumps({"artifacts": [str(artifact)]}),
+    )
+
+    assert _cmd_complete(args) != 0
+    assert auxiliary_calls == []
+    with kb.connect() as conn:
+        after = (
+            tuple(conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()),
+            tuple(conn.execute(
+                "SELECT * FROM task_runs WHERE id = ?", (current_run_id,)
+            ).fetchone()),
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+        )
+    assert after == before
+    attachment_dir = kb.task_attachments_dir(task_id)
+    assert not attachment_dir.exists() or list(attachment_dir.iterdir()) == []
+    assert artifact.read_text(encoding="utf-8") == "must remain scratch-only"
+
+
+def test_cli_exact_scoped_goal_run_still_invokes_judge(
+    kanban_home, monkeypatch
+):
+    import argparse
+
+    from hermes_cli.kanban import _cmd_complete
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="valid scoped CLI goal",
+            assignee="goal-worker",
+            goal_mode=True,
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="goal-worker")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    calls: list[str] = []
+
+    def available(_name):
+        calls.append("availability")
+        return object(), "judge-model"
+
+    def reject(**_kwargs):
+        calls.append("judge")
+        return "continue", "needs evidence", False, None, False
+
+    monkeypatch.setattr("agent.auxiliary_client.get_text_auxiliary_client", available)
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", reject)
+    args = argparse.Namespace(
+        task_ids=[task_id],
+        summary="not enough evidence",
+        result=None,
+        metadata=None,
+    )
+
+    assert _cmd_complete(args) != 0
+    assert calls == ["availability", "judge"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "running"

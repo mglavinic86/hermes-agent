@@ -644,10 +644,13 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
@@ -2170,6 +2173,112 @@ def test_worker_complete_rejects_missing_or_invalid_run_identity(
     assert after is not None
     assert after.status == "running"
     assert after.current_run_id == current_run_id
+
+
+@pytest.mark.parametrize(
+    "run_identity",
+    [None, "malformed", "0", "-1", "stale", "foreign"],
+)
+def test_goal_complete_rejects_invalid_scoped_run_before_auxiliary_judge(
+    monkeypatch, tmp_path, run_identity
+):
+    """Invalid worker identity must not spend judge calls or mutate completion state."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    task_id = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        current_run_id = task.current_run_id
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "billable-judge.txt"
+        artifact.write_text("must remain scratch-only", encoding="utf-8")
+
+        foreign_task_id = kb.create_task(conn, title="foreign run", assignee="other")
+        foreign_task = kb.claim_task(conn, foreign_task_id, claimer="other")
+        assert foreign_task is not None and foreign_task.current_run_id is not None
+        foreign_run_id = foreign_task.current_run_id
+
+        def snapshot():
+            return (
+                tuple(conn.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()),
+                tuple(conn.execute(
+                    "SELECT * FROM task_runs WHERE id = ?", (current_run_id,)
+                ).fetchone()),
+                [tuple(row) for row in conn.execute(
+                    "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                )],
+                [tuple(row) for row in conn.execute(
+                    "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                )],
+                [tuple(row) for row in conn.execute(
+                    "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                )],
+            )
+
+        before = snapshot()
+
+    if run_identity is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    elif run_identity == "stale":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current_run_id + 100_000))
+    elif run_identity == "foreign":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(foreign_run_id))
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_identity)
+
+    auxiliary_calls: list[str] = []
+
+    def billable_availability_probe():
+        auxiliary_calls.append("availability")
+        return True
+
+    def billable_judge(*_args, **_kwargs):
+        auxiliary_calls.append("judge")
+        return "done", "accepted", False, None, False
+
+    monkeypatch.setattr(kt, "_goal_judge_available", billable_availability_probe)
+    monkeypatch.setattr(kt, "judge_goal", billable_judge)
+
+    result = json.loads(kt._handle_complete({
+        "summary": "claiming goal completion",
+        "artifacts": [str(artifact)],
+    }))
+
+    assert result.get("ok") is not True
+    assert auxiliary_calls == []
+    with kb.connect() as conn:
+        after = (
+            tuple(conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()),
+            tuple(conn.execute(
+                "SELECT * FROM task_runs WHERE id = ?", (current_run_id,)
+            ).fetchone()),
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+        )
+    assert after == before
+    attachment_dir = kb.task_attachments_dir(task_id)
+    assert not attachment_dir.exists() or list(attachment_dir.iterdir()) == []
+    assert artifact.read_text(encoding="utf-8") == "must remain scratch-only"
 
 
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):

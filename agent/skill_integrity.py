@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Mapping
 
 PINNED_SKILL_DIGESTS_ENV = "HERMES_KANBAN_PINNED_SKILL_DIGESTS"
+_DURABLE_REVIEW_SKILL = "immutable-change-reviews"
 _SKILL_DIGEST_CONTRACT = b"turpi-skill-snapshot-v1\0"
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -101,6 +102,14 @@ def verify_pinned_skill_tree(
     pinned = pinned_skill_digests_from_env()
     if "*" in pinned:
         return False, "malformed dispatcher-pinned skill digest map"
+    if (
+        name == _DURABLE_REVIEW_SKILL
+        and (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and (os.environ.get("HERMES_KANBAN_ROLE") or "").strip().lower()
+        == "reviewer"
+        and name not in pinned
+    ):
+        return False, "missing dispatcher-pinned reviewer skill digest"
 
     pinned_name = name if name in pinned else None
     resolved_skill_dir: Path | None = None

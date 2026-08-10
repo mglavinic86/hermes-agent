@@ -1600,6 +1600,77 @@ def test_pinned_reviewer_skill_mutation_after_preflight_fails_child_preload(
     assert missing == ["immutable-change-reviews"]
 
 
+@pytest.mark.parametrize("digest_bridge", [None, "{}"], ids=["absent", "empty"])
+def test_scoped_reviewer_preload_requires_nonempty_dispatcher_digest_bridge(
+    kanban_home, monkeypatch, digest_bridge
+):
+    """A durable reviewer child must never downgrade to an unpinned preload."""
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from agent.skill_integrity import PINNED_SKILL_DIGESTS_ENV
+
+    _skill_dir, _expected_digest, child_env = (
+        _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch)
+    )
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+    assert child_env["HERMES_KANBAN_TASK"]
+    assert child_env["HERMES_KANBAN_ROLE"] == "reviewer"
+    if digest_bridge is None:
+        monkeypatch.delenv(PINNED_SKILL_DIGESTS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(PINNED_SKILL_DIGESTS_ENV, digest_bridge)
+
+    prompt, loaded, missing = build_preloaded_skills_prompt(
+        ["immutable-change-reviews"]
+    )
+
+    assert prompt == ""
+    assert loaded == []
+    assert missing == ["immutable-change-reviews"]
+
+
+def test_valid_reviewer_digest_bridge_does_not_pin_ordinary_sibling_skills(
+    kanban_home, monkeypatch
+):
+    from agent.skill_commands import build_preloaded_skills_prompt
+
+    _skill_dir, _expected_digest, child_env = (
+        _dispatch_pinned_reviewer_and_capture_child_env(kanban_home, monkeypatch)
+    )
+    _create_profile_skill(kanban_home, "reviewer", "review-notes")
+    for key, value in child_env.items():
+        monkeypatch.setenv(key, value)
+
+    prompt, loaded, missing = build_preloaded_skills_prompt(
+        ["immutable-change-reviews", "review-notes"]
+    )
+
+    assert prompt
+    assert loaded == ["immutable-change-reviews", "review-notes"]
+    assert missing == []
+
+
+def test_unscoped_manual_reviewer_skill_preload_remains_unpinned(
+    kanban_home, monkeypatch
+):
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from agent.skill_integrity import PINNED_SKILL_DIGESTS_ENV
+
+    _create_reviewer_snapshot(kanban_home)
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home / "profiles" / "reviewer"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_ROLE", raising=False)
+    monkeypatch.delenv(PINNED_SKILL_DIGESTS_ENV, raising=False)
+
+    prompt, loaded, missing = build_preloaded_skills_prompt(
+        ["immutable-change-reviews"]
+    )
+
+    assert prompt
+    assert loaded == ["immutable-change-reviews"]
+    assert missing == []
+
+
 def test_pinned_reviewer_skill_mutation_after_preload_fails_linked_read(
     kanban_home, monkeypatch
 ):

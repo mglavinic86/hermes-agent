@@ -8,6 +8,7 @@ and that a misbehaving hook callback never breaks the transition.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,70 @@ def test_block_fires_hook_with_reason(kanban_home, captured_hooks):
     kw = fired[0][1]
     assert kw["task_id"] == tid
     assert kw["reason"] == "needs human"
+
+
+def test_dependency_block_commit_failure_fires_no_hook(
+    kanban_home, captured_hooks, monkeypatch
+):
+    """A dependency hook must never announce a transaction that rolled back."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="dependency wait", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        before_events = [
+            (event.kind, event.payload) for event in kb.list_events(conn, task_id)
+        ]
+        real_boundary = kb._execute_boundary_with_retry
+
+        def fail_commit(connection, sql):
+            if sql.strip().upper() == "COMMIT":
+                raise sqlite3.OperationalError("injected dependency commit failure")
+            return real_boundary(connection, sql)
+
+        monkeypatch.setattr(kb, "_execute_boundary_with_retry", fail_commit)
+        with pytest.raises(sqlite3.OperationalError, match="dependency commit failure"):
+            kb.block_task(
+                conn,
+                task_id,
+                reason="waiting on parent",
+                kind="dependency",
+                comment_author="operator",
+                comment_body="BLOCKED: waiting on parent",
+            )
+
+        assert kb.get_task(conn, task_id).status == "running"
+        assert kb.list_comments(conn, task_id) == []
+        assert [
+            (event.kind, event.payload) for event in kb.list_events(conn, task_id)
+        ] == before_events
+
+    assert [e for e in captured_hooks if e[0] == "kanban_task_blocked"] == []
+
+
+def test_dependency_block_fires_one_hook_after_atomic_reason_comment(
+    kanban_home, captured_hooks
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="dependency wait", assignee="worker")
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="waiting on parent",
+            kind="dependency",
+            comment_author="operator",
+            comment_body="BLOCKED: waiting on parent",
+        )
+        assert kb.get_task(conn, task_id).status == "todo"
+        comments = kb.list_comments(conn, task_id)
+
+    assert [(comment.author, comment.body) for comment in comments] == [
+        ("operator", "BLOCKED: waiting on parent")
+    ]
+    fired = [e for e in captured_hooks if e[0] == "kanban_task_blocked"]
+    assert len(fired) == 1
+    assert fired[0][1]["task_id"] == task_id
+    assert fired[0][1]["reason"] == "waiting on parent"
 
 
 def test_no_hook_on_failed_transition(kanban_home, captured_hooks):

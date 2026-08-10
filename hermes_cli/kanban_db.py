@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -2926,7 +2926,11 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection):
+def write_txn(
+    conn: sqlite3.Connection,
+    *,
+    _on_rollback: Optional[Callable[[], None]] = None,
+):
     """Context manager for an IMMEDIATE write transaction.
 
     Use for any multi-statement write (creating a task + link, claiming a
@@ -2937,6 +2941,14 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    def _compensate() -> None:
+        if _on_rollback is None:
+            return
+        try:
+            _on_rollback()
+        except Exception:
+            _log.exception("kanban write rollback compensation failed")
+
     _assert_not_delegated_child_mutation()
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
@@ -2949,6 +2961,7 @@ def write_txn(conn: sqlite3.Connection):
             # under EIO, lock contention, or corruption). Nothing to undo;
             # do not let this secondary failure shadow the real one.
             pass
+        _compensate()
         raise
     else:
         try:
@@ -2960,6 +2973,7 @@ def write_txn(conn: sqlite3.Connection):
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
+            _compensate()
             raise
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
@@ -4595,26 +4609,41 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
-def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+def _insert_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
 ) -> int:
+    """Insert a comment inside the caller's active write transaction."""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    if not conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone():
+        raise ValueError(f"unknown task {task_id}")
     now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, author.strip(), body.strip(), now),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "commented",
+        {"author": author, "len": len(body)},
+    )
+    return int(cur.lastrowid or 0)
+
+
+def add_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str
+) -> int:
     with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
-            raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
-        )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        return _insert_comment(conn, task_id, author, body)
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -5959,7 +5988,22 @@ def complete_task(
         metadata = _merge_completion_prose_artifacts(
             conn, task_id, metadata, summary=summary, result=result,
         )
-    with write_txn(conn):
+    staged_artifacts: list[Path] = []
+
+    def _discard_staged_artifacts() -> None:
+        staged_dirs = {path.parent for path in staged_artifacts}
+        for path in staged_artifacts:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for directory in staged_dirs:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+
+    with write_txn(conn, _on_rollback=_discard_staged_artifacts):
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5998,7 +6042,9 @@ def complete_task(
         if cur.rowcount != 1:
             return False
         if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            staged_artifacts.extend(
+                _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            )
             for stored_path in metadata.pop("_staged_artifacts", []):
                 path = Path(stored_path)
                 _insert_completion_attachment(
@@ -6157,28 +6203,28 @@ def _persist_scratch_completion_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: dict,
-) -> None:
+) -> list[Path]:
     """Copy scratch-workspace completion artifacts before cleanup removes them."""
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
-        return
+        return []
 
     row = conn.execute(
         "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
-        return
+        return []
 
     workspace = Path(row["workspace_path"]).expanduser()
     is_managed, board = _managed_scratch_path_info(workspace)
     if not is_managed:
-        return
+        return []
 
     try:
         workspace_root = workspace.resolve()
     except OSError:
-        return
+        return []
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
@@ -6260,6 +6306,7 @@ def _persist_scratch_completion_artifacts(
         metadata["_staged_artifacts"] = [
             path for path in persisted if path.startswith(str(attachment_dir.resolve()))
         ]
+    return list(used_destinations)
 
 
 def _insert_completion_attachment(
@@ -6680,6 +6727,8 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    comment_author: Optional[str] = None,
+    comment_body: Optional[str] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6712,28 +6761,11 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
-    routed_to = "blocked"
-    recurrences = 0
-    with write_txn(conn):
-        cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if cur_row is None:
-            return False
-        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
-        prev_recurrences = (
-            int(cur_row["block_recurrences"])
-            if "block_recurrences" in cur_row.keys()
-            and cur_row["block_recurrences"] is not None
-            else 0
-        )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+    # Dependency waits take a distinct route, but retain the same contract as
+    # every lifecycle hook: publish only after the write transaction commits.
+    if kind == "dependency":
+        with write_txn(conn):
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6763,17 +6795,39 @@ def block_task(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
-            routed_to = "todo"
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return True
+            if comment_author is not None or comment_body is not None:
+                _insert_comment(
+                    conn,
+                    task_id,
+                    comment_author or "",
+                    comment_body or "",
+                )
+            blocked_task = get_task(conn, task_id)
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=blocked_task.assignee if blocked_task else None,
+            run_id=run_id,
+            reason=reason,
+        )
+        return True
+
+    recurrences = 0
+    with write_txn(conn):
+        cur_row = conn.execute(
+            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if cur_row is None:
+            return False
+        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
+        prev_recurrences = (
+            int(cur_row["block_recurrences"])
+            if "block_recurrences" in cur_row.keys()
+            and cur_row["block_recurrences"] is not None
+            else 0
+        )
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only
@@ -6823,7 +6877,6 @@ def block_task(
                 },
                 run_id=run_id,
             )
-            routed_to = "triage"
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -6875,6 +6928,13 @@ def block_task(
                 conn, task_id, "blocked",
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
+            )
+        if comment_author is not None or comment_body is not None:
+            _insert_comment(
+                conn,
+                task_id,
+                comment_author or "",
+                comment_body or "",
             )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
@@ -7754,6 +7814,8 @@ def schedule_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    comment_author: Optional[str] = None,
+    comment_body: Optional[str] = None,
 ) -> bool:
     """Park a task in ``scheduled`` so it is waiting on time, not human input.
 
@@ -7790,6 +7852,13 @@ def schedule_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        if comment_author is not None or comment_body is not None:
+            _insert_comment(
+                conn,
+                task_id,
+                comment_author or "",
+                comment_body or "",
+            )
         return True
 
 
@@ -11298,6 +11367,28 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
         "SELECT * FROM task_runs WHERE id = ?", (int(run_id),),
     ).fetchone()
     return Run.from_row(row) if row else None
+
+
+def task_has_active_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: object,
+) -> bool:
+    """Return whether ``expected_run_id`` is this task's exact active run."""
+    try:
+        run_id = int(expected_run_id)
+    except (TypeError, ValueError):
+        return False
+    if run_id < 1:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM tasks t "
+        "JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+        "WHERE t.id = ? AND t.status IN ('running', 'ready', 'blocked') "
+        "AND t.current_run_id = ? AND r.ended_at IS NULL",
+        (task_id, run_id),
+    ).fetchone()
+    return row is not None
 
 
 def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:

@@ -2176,6 +2176,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        expected_run_ids: dict[str, Optional[int]] = {}
+        for tid in ids:
+            expected_run_id = _worker_run_id_for(tid)
+            if (
+                expected_run_id is not None
+                and not kb.task_has_active_run(conn, tid, expected_run_id)
+            ):
+                print(
+                    f"cannot complete {tid} (missing, invalid, stale, or "
+                    "foreign worker run identity)",
+                    file=sys.stderr,
+                )
+                return 1
+            expected_run_ids[tid] = expected_run_id
+
         for tid in ids:
             # Goal-mode pre-completion judge gate (mirrors the gate in
             # tools/kanban_tools.py:_handle_complete — Issue #38367).
@@ -2226,7 +2241,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_ids[tid],
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -2277,12 +2292,12 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
+                comment_author=author if reason else None,
+                comment_body=f"BLOCKED: {reason}" if reason else None,
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
-                if reason:
-                    kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -2312,12 +2327,12 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
+                comment_author=author if reason else None,
+                comment_body=f"SCHEDULED: {reason}" if reason else None,
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
-                if reason:
-                    kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 

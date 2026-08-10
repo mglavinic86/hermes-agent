@@ -2399,6 +2399,82 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+@pytest.mark.parametrize("failure_point", ["end_run", "commit"])
+def test_complete_task_removes_only_new_staged_files_when_transaction_fails(
+    kanban_home, monkeypatch, failure_point
+):
+    """A rolled-back completion must not orphan its copied scratch artifact."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="preserve report")
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "report.txt"
+        artifact.write_text("new staged report", encoding="utf-8")
+
+        kb.store_attachment_bytes(
+            conn,
+            task_id,
+            "report.txt",
+            b"already committed",
+            uploaded_by="owner",
+        )
+        attachment_dir = kb.task_attachments_dir(task_id)
+        before_files = {
+            path.name: path.read_bytes()
+            for path in attachment_dir.iterdir()
+            if path.is_file()
+        }
+        before_attachments = [
+            (item.filename, item.stored_path) for item in kb.list_attachments(conn, task_id)
+        ]
+        before_events = [
+            (event.kind, event.payload) for event in kb.list_events(conn, task_id)
+        ]
+
+        if failure_point == "end_run":
+            def fail_end_run(*_args, **_kwargs):
+                raise RuntimeError("injected end-run failure")
+
+            monkeypatch.setattr(kb, "_end_run", fail_end_run)
+            expected_error = RuntimeError
+        else:
+            real_boundary = kb._execute_boundary_with_retry
+
+            def fail_completion_commit(connection, sql):
+                if sql.strip().upper() == "COMMIT":
+                    raise sqlite3.OperationalError("injected commit failure")
+                return real_boundary(connection, sql)
+
+            monkeypatch.setattr(kb, "_execute_boundary_with_retry", fail_completion_commit)
+            expected_error = sqlite3.OperationalError
+
+        with pytest.raises(expected_error):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="report complete",
+                metadata={"artifacts": [str(artifact)]},
+            )
+
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert [
+            (item.filename, item.stored_path) for item in kb.list_attachments(conn, task_id)
+        ] == before_attachments
+        assert [
+            (event.kind, event.payload) for event in kb.list_events(conn, task_id)
+        ] == before_events
+
+    after_files = {
+        path.name: path.read_bytes()
+        for path in attachment_dir.iterdir()
+        if path.is_file()
+    }
+    assert after_files == before_files
+    assert workspace.is_dir()
+    assert artifact.read_text(encoding="utf-8") == "new staged report"
+
+
 def test_complete_task_rejects_missing_declared_scratch_artifact(kanban_home):
     """A declared scratch deliverable must not disappear behind a false Done."""
     with kb.connect() as conn:

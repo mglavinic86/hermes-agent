@@ -746,6 +746,15 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            expected_run_id = _worker_run_id(tid)
+            if (
+                expected_run_id is not None
+                and not kb.task_has_active_run(conn, tid, expected_run_id)
+            ):
+                return tool_error(
+                    f"could not complete {tid} (missing, invalid, stale, or "
+                    "foreign worker run identity)"
+                )
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -787,7 +796,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=expected_run_id,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
