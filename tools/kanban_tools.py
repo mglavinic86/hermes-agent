@@ -29,6 +29,7 @@ through the board.
 from __future__ import annotations
 
 import json
+import functools
 import logging
 import os
 from typing import Any, Optional
@@ -47,6 +48,70 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+
+KANBAN_ROLE_CAPABILITIES = {
+    "worker": frozenset({
+        "kanban_show", "kanban_complete", "kanban_block",
+        "kanban_heartbeat", "kanban_comment", "kanban_attach",
+        "kanban_attach_url", "kanban_attachments",
+    }),
+    "reviewer": frozenset({
+        "kanban_show", "kanban_complete", "kanban_block",
+        "kanban_heartbeat", "kanban_comment", "kanban_attachments",
+    }),
+    "orchestrator": frozenset({
+        "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
+        "kanban_heartbeat", "kanban_comment", "kanban_attach",
+        "kanban_attach_url", "kanban_attachments", "kanban_create",
+        "kanban_unblock", "kanban_link",
+    }),
+}
+
+
+def _explicit_dispatched_role() -> Optional[str]:
+    """Return trusted dispatcher role, ``None`` for legacy/unscoped sessions."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    raw = os.environ.get("HERMES_KANBAN_ROLE")
+    if raw is None:
+        return None
+    return raw.strip().lower()
+
+
+def _require_kanban_capability(tool_name: str) -> Optional[str]:
+    """Handler-level guard for explicit dispatcher role capabilities.
+
+    Legacy task environments without ``HERMES_KANBAN_ROLE`` retain the old
+    surface. New dispatchers always stamp a trusted role. Unknown explicit
+    roles fail closed instead of silently inheriting worker powers.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    role = _explicit_dispatched_role()
+    if role is None:
+        return None
+    allowed = KANBAN_ROLE_CAPABILITIES.get(role)
+    if allowed is None:
+        return tool_error(
+            f"invalid dispatched kanban role {role!r}; refusing {tool_name}"
+        )
+    if tool_name not in allowed:
+        return tool_error(
+            f"{tool_name} is not permitted for dispatched kanban role {role}; "
+            "board routing is orchestrator-only and reviewer artifact writes "
+            "are disabled"
+        )
+    return None
+
+
+def _guarded_handler(tool_name: str, handler):
+    """Apply the runtime role guard even if registry visibility is stale."""
+    @functools.wraps(handler)
+    def _wrapped(args: dict, **kw):
+        denied = _require_kanban_capability(tool_name)
+        return denied if denied else handler(args, **kw)
+
+    return _wrapped
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -104,7 +169,8 @@ def _check_kanban_mode() -> bool:
     if _is_delegated_child_context():
         return False
     if os.environ.get("HERMES_KANBAN_TASK"):
-        return True
+        role = _explicit_dispatched_role()
+        return role is None or role in KANBAN_ROLE_CAPABILITIES
     return _profile_has_kanban_toolset()
 
 
@@ -120,7 +186,24 @@ def _check_kanban_orchestrator_mode() -> bool:
     if _is_delegated_child_context():
         return False
     if os.environ.get("HERMES_KANBAN_TASK"):
-        return False
+        role = _explicit_dispatched_role()
+        return role == "orchestrator"
+    return _profile_has_kanban_toolset()
+
+
+def _check_kanban_routing_mode() -> bool:
+    """Routing tools are explicit-orchestrator only for hardened dispatches."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        role = _explicit_dispatched_role()
+        return role is None or role == "orchestrator"
+    return _profile_has_kanban_toolset()
+
+
+def _check_kanban_artifact_write_mode() -> bool:
+    """Reviewers may inspect attachments but may not upload/replace evidence."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        role = _explicit_dispatched_role()
+        return role is None or role in {"worker", "orchestrator"}
     return _profile_has_kanban_toolset()
 
 
@@ -205,9 +288,17 @@ def _connect(board: Optional[str] = None):
     routes the connection to that board's sqlite file. ``None`` (the
     default) preserves the legacy resolution chain
     (``HERMES_KANBAN_DB`` → ``HERMES_KANBAN_BOARD`` env → current symlink
-    → ``default``). Per-tool ``board`` lets a Telegram-side agent override
-    the env-pinned active board without restarting Hermes.
+    → ``default``). Per-tool ``board`` lets an unscoped Telegram-side agent
+    or an explicit orchestrator override the active board without restarting
+    Hermes. Hardened worker/reviewer dispatches are pinned to the trusted
+    dispatcher board and may not route into another board by argument.
     """
+    role = _explicit_dispatched_role()
+    if board is not None and role is not None and role != "orchestrator":
+        raise PermissionError(
+            f"board routing is orchestrator-only; dispatched kanban role "
+            f"{role!r} may not override board"
+        )
     from hermes_cli import kanban_db as kb
     return kb, kb.connect(board=board)
 
@@ -357,11 +448,14 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     structured tool_error so the model gets a clear refusal instead of
     silently mutating board state from a worker context.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    denied = _require_kanban_capability(tool_name)
+    if denied:
+        return denied
+    if os.environ.get("HERMES_KANBAN_TASK") and _explicit_dispatched_role() is None:
+        # Legacy dispatcher env: preserve the historical list/unblock denial.
         return tool_error(
-            f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
-            "must use kanban_complete, kanban_block, kanban_heartbeat, or "
-            "kanban_comment for their assigned task."
+            f"{tool_name} is orchestrator-only; legacy dispatcher-spawned "
+            "workers cannot use it"
         )
     return None
 
@@ -549,8 +643,21 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
-    summary = args.get("summary")
     metadata = args.get("metadata")
+    artifacts = args.get("artifacts")
+    dispatch_role = _explicit_dispatched_role()
+    if dispatch_role == "reviewer" and (
+        artifacts
+        or (
+            isinstance(metadata, dict)
+            and ({"artifacts", "_staged_artifacts"} & metadata.keys())
+        )
+    ):
+        return tool_error(
+            "reviewer role may not publish artifact paths through "
+            "kanban_complete; use comments or existing attachment reads"
+        )
+    summary = args.get("summary")
     result = args.get("result")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
@@ -564,7 +671,6 @@ def _handle_complete(args: dict, **kw) -> str:
         except json.JSONDecodeError:
             pass
     created_cards = args.get("created_cards")
-    artifacts = args.get("artifacts")
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -625,6 +731,12 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    if dispatch_role is not None:
+        metadata = dict(metadata or {})
+        # Trusted dispatcher provenance: overwrite any model-provided value.
+        # The DB completion path and gateway notifier use this marker to keep
+        # reviewer verdict completion separate from artifact publication.
+        metadata["_kanban_dispatch_role"] = dispatch_role
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -2047,11 +2159,36 @@ KANBAN_LINK_SCHEMA = {
 # Registration
 # ---------------------------------------------------------------------------
 
+
+def _role_scoped_schema_overrides(schema: dict):
+    """Return per-call schema overrides for hardened task-scoped roles.
+
+    Board selection is routing authority, so worker/reviewer schemas must not
+    advertise ``board`` even though the same static schema serves legacy and
+    unscoped orchestrator contexts. Reviewer completion is verdict-only and
+    likewise must not advertise artifact publication.
+    """
+    def _overrides() -> dict:
+        role = _explicit_dispatched_role()
+        if role not in {"worker", "reviewer"}:
+            return {}
+        parameters = dict(schema.get("parameters") or {})
+        properties = dict(parameters.get("properties") or {})
+        properties.pop("board", None)
+        if role == "reviewer" and schema.get("name") == "kanban_complete":
+            properties.pop("artifacts", None)
+        parameters["properties"] = properties
+        return {"parameters": parameters}
+
+    return _overrides
+
+
 registry.register(
     name="kanban_show",
     toolset="kanban",
     schema=KANBAN_SHOW_SCHEMA,
-    handler=_handle_show,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_SHOW_SCHEMA),
+    handler=_guarded_handler("kanban_show", _handle_show),
     check_fn=_check_kanban_mode,
     emoji="📋",
 )
@@ -2060,7 +2197,8 @@ registry.register(
     name="kanban_list",
     toolset="kanban",
     schema=KANBAN_LIST_SCHEMA,
-    handler=_handle_list,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_LIST_SCHEMA),
+    handler=_guarded_handler("kanban_list", _handle_list),
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
 )
@@ -2069,7 +2207,8 @@ registry.register(
     name="kanban_complete",
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
-    handler=_handle_complete,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_COMPLETE_SCHEMA),
+    handler=_guarded_handler("kanban_complete", _handle_complete),
     check_fn=_check_kanban_mode,
     emoji="✔",
 )
@@ -2078,7 +2217,8 @@ registry.register(
     name="kanban_block",
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
-    handler=_handle_block,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_BLOCK_SCHEMA),
+    handler=_guarded_handler("kanban_block", _handle_block),
     check_fn=_check_kanban_mode,
     emoji="⏸",
 )
@@ -2087,7 +2227,8 @@ registry.register(
     name="kanban_heartbeat",
     toolset="kanban",
     schema=KANBAN_HEARTBEAT_SCHEMA,
-    handler=_handle_heartbeat,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_HEARTBEAT_SCHEMA),
+    handler=_guarded_handler("kanban_heartbeat", _handle_heartbeat),
     check_fn=_check_kanban_mode,
     emoji="💓",
 )
@@ -2096,7 +2237,8 @@ registry.register(
     name="kanban_comment",
     toolset="kanban",
     schema=KANBAN_COMMENT_SCHEMA,
-    handler=_handle_comment,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_COMMENT_SCHEMA),
+    handler=_guarded_handler("kanban_comment", _handle_comment),
     check_fn=_check_kanban_mode,
     emoji="💬",
 )
@@ -2105,8 +2247,9 @@ registry.register(
     name="kanban_attach",
     toolset="kanban",
     schema=KANBAN_ATTACH_SCHEMA,
-    handler=_handle_attach,
-    check_fn=_check_kanban_mode,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_ATTACH_SCHEMA),
+    handler=_guarded_handler("kanban_attach", _handle_attach),
+    check_fn=_check_kanban_artifact_write_mode,
     emoji="📎",
 )
 
@@ -2114,8 +2257,9 @@ registry.register(
     name="kanban_attach_url",
     toolset="kanban",
     schema=KANBAN_ATTACH_URL_SCHEMA,
-    handler=_handle_attach_url,
-    check_fn=_check_kanban_mode,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_ATTACH_URL_SCHEMA),
+    handler=_guarded_handler("kanban_attach_url", _handle_attach_url),
+    check_fn=_check_kanban_artifact_write_mode,
     emoji="📎",
 )
 
@@ -2123,7 +2267,8 @@ registry.register(
     name="kanban_attachments",
     toolset="kanban",
     schema=KANBAN_ATTACHMENTS_SCHEMA,
-    handler=_handle_attachments,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_ATTACHMENTS_SCHEMA),
+    handler=_guarded_handler("kanban_attachments", _handle_attachments),
     check_fn=_check_kanban_mode,
     emoji="📎",
 )
@@ -2132,8 +2277,9 @@ registry.register(
     name="kanban_create",
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
-    handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_CREATE_SCHEMA),
+    handler=_guarded_handler("kanban_create", _handle_create),
+    check_fn=_check_kanban_routing_mode,
     emoji="➕",
 )
 
@@ -2141,7 +2287,8 @@ registry.register(
     name="kanban_unblock",
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
-    handler=_handle_unblock,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_UNBLOCK_SCHEMA),
+    handler=_guarded_handler("kanban_unblock", _handle_unblock),
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
 )
@@ -2150,7 +2297,8 @@ registry.register(
     name="kanban_link",
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
-    handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    dynamic_schema_overrides=_role_scoped_schema_overrides(KANBAN_LINK_SCHEMA),
+    handler=_guarded_handler("kanban_link", _handle_link),
+    check_fn=_check_kanban_routing_mode,
     emoji="🔗",
 )

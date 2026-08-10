@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+import cli as cli_module
 from hermes_cli import kanban_db as kb
 from hermes_cli import goals
 
@@ -55,6 +56,119 @@ def test_goal_mode_persists(kanban_home):
         task = kb.get_task(conn, tid)
     assert task.goal_mode is True
     assert task.goal_max_turns == 7
+    assert task.goal_turns_used == 0
+
+
+def test_goal_turn_budget_is_durable_and_bounded_across_connections(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="durable goal",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=3,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+
+    observed = []
+    for _ in range(4):
+        with kb.connect() as conn:
+            observed.append(
+                kb.reserve_goal_turn(
+                    conn,
+                    tid,
+                    max_turns=3,
+                    expected_run_id=run_id,
+                )
+            )
+
+    assert observed == [1, 2, 3, None]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).goal_turns_used == 3
+
+
+def test_goal_turn_reservation_rejects_stale_worker_run(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="run guarded",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=5,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        current_run_id = claimed.current_run_id
+
+        assert kb.reserve_goal_turn(
+            conn,
+            tid,
+            max_turns=5,
+            expected_run_id=current_run_id + 1,
+        ) is None
+        assert kb.get_task(conn, tid).goal_turns_used == 0
+
+
+def test_goal_turn_counter_survives_reclaim_and_new_run(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="crash safe",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=3,
+        )
+        first = kb.claim_task(conn, tid)
+        assert first is not None
+        assert kb.reserve_goal_turn(
+            conn, tid, max_turns=3, expected_run_id=first.current_run_id
+        ) == 1
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL "
+            "WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        second = kb.claim_task(conn, tid)
+        assert second is not None
+        assert second.current_run_id != first.current_run_id
+        assert kb.reserve_goal_turn(
+            conn, tid, max_turns=3, expected_run_id=second.current_run_id
+        ) == 2
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).goal_turns_used == 2
+
+
+def test_exhausted_goal_budget_blocks_before_new_run_is_created(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="no replacement run",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=2,
+        )
+        conn.execute("UPDATE tasks SET goal_turns_used=2 WHERE id=?", (tid,))
+        conn.commit()
+        runs_before = len(kb.list_runs(conn, tid))
+
+        assert kb.claim_task(conn, tid) is None
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.goal_turns_used == 2
+        assert len(kb.list_runs(conn, tid)) == runs_before
+
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        blocked_events = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+        assert blocked_events
+        assert isinstance(blocked_events[-1].payload, dict)
+        assert blocked_events[-1].payload["reason"] == "goal_turn_budget_exhausted"
 
 
 def test_goal_mode_without_max_turns(kanban_home):
@@ -65,6 +179,84 @@ def test_goal_mode_without_max_turns(kanban_home):
         task = kb.get_task(conn, tid)
     assert task.goal_mode is True
     assert task.goal_max_turns is None
+    assert task.goal_turns_used == 0
+
+
+def test_cli_reserves_first_turn_before_model_and_blocks_at_limit(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="one turn only",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=1,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+
+    assert cli_module._reserve_kanban_goal_first_turn_q() is True
+    assert cli_module._reserve_kanban_goal_first_turn_q() is False
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.goal_turns_used == 1
+        assert task.status == "blocked"
+
+
+@pytest.mark.parametrize("run_id_env", [None, "not-an-int", "0", "-1"])
+def test_cli_goal_reservation_requires_current_positive_run_identity(
+    kanban_home, monkeypatch, run_id_env
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="identity guarded",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=3,
+        )
+        stale = kb.claim_task(conn, tid)
+        assert stale is not None
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL "
+            "WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        current = kb.claim_task(conn, tid)
+        assert current is not None
+        assert current.current_run_id != stale.current_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    if run_id_env is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id_env)
+
+    assert cli_module._reserve_kanban_goal_first_turn_q() is False
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == current.current_run_id
+        assert task.goal_turns_used == 0
+        assert kb.reserve_goal_turn(
+            conn,
+            tid,
+            max_turns=3,
+            expected_run_id=None,
+        ) is None
+        persisted = kb.get_task(conn, tid)
+        assert persisted is not None
+        assert persisted.goal_turns_used == 0
 
 
 def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
@@ -111,10 +303,12 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
         assert "goal_mode" in cols
         assert "goal_max_turns" in cols
+        assert "goal_turns_used" in cols
         task = kb.get_task(conn, "legacy1")
     # Existing row keeps the safe default.
     assert task.goal_mode is False
     assert task.goal_max_turns is None
+    assert task.goal_turns_used == 0
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +437,30 @@ def test_loop_blocks_on_budget_exhaustion(monkeypatch):
     assert res["outcome"] == "blocked_budget"
     assert res["turns_used"] == 3
     assert "turn budget" in blocked["reason"].lower()
+
+
+def test_loop_consumes_durable_cumulative_budget(monkeypatch):
+    _patch_judge(monkeypatch, ["continue", "continue"])
+    blocked = {}
+    reservations = iter([3])
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="durable",
+        goal_text="bounded across restarts",
+        run_turn=lambda p: turns.append(p) or "still going",
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason: blocked.setdefault("reason", reason),
+        max_turns=3,
+        first_response="second cumulative turn",
+        initial_turns_used=2,
+        reserve_turn_fn=lambda: next(reservations),
+    )
+
+    assert len(turns) == 1
+    assert res["outcome"] == "blocked_budget"
+    assert res["turns_used"] == 3
+    assert "3/3" in blocked["reason"]
 
 
 def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
