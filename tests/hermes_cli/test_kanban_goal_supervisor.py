@@ -528,6 +528,101 @@ def test_newer_runless_status_event_does_not_mask_run_closing_event(
     assert notifications[0].payload["event"] == "status:triage"
 
 
+def test_db_transition_cas_rejects_completion_after_newer_run_claimed(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import profiles
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    with kb.connect() as conn:
+        created = create_durable_goal(
+            conn,
+            objective="Reject stale completion inside the write transaction",
+            origin=GoalOrigin(platform="telegram", chat_id="owner-chat"),
+            board="default",
+            builder_profile="builder",
+            verifier_profile="verifier",
+            reviewer_profile="reviewer",
+            repair_budget=1,
+            review_retry_budget=1,
+        )
+        run_one_task = kb.claim_task(conn, created.task_id, claimer="builder")
+        assert run_one_task is not None and run_one_task.current_run_id is not None
+        run_one = run_one_task.current_run_id
+        assert _set_status_direct(conn, created.task_id, "todo")
+        run_one_event = next(
+            event
+            for event in reversed(kb.list_events(conn, created.task_id))
+            if event.kind == "status" and event.run_id == run_one
+        )
+        assert _set_status_direct(conn, created.task_id, "ready")
+        run_two_task = kb.claim_task(conn, created.task_id, claimer="builder")
+        assert run_two_task is not None and run_two_task.current_run_id != run_one
+
+        assert kb.transition_durable_goal_to_successor(
+            conn,
+            goal_id=created.goal_id,
+            expected_state_version=1,
+            predecessor_task_id=created.task_id,
+            completion_event_id=run_one_event.id,
+            expected_run_id=run_one,
+            next_stage="VERIFY",
+            next_attempt=0,
+            assignee="verifier",
+            completion_payload={"status": "PASS"},
+        ) is None
+        assert not kb.transition_durable_goal_to_terminal(
+            conn,
+            goal_id=created.goal_id,
+            expected_state_version=1,
+            predecessor_task_id=created.task_id,
+            completion_event_id=run_one_event.id,
+            expected_run_id=run_one,
+            completion_payload={"event": "status:todo"},
+            terminal_status="BLOCKED",
+            notification_kind="BLOCKED",
+            notification_payload={"status": "BLOCKED"},
+            blocked_reason="stale run must not terminate",
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        bindings = list_durable_goal_tasks(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert goal is not None and goal.status == "ACTIVE"
+    assert goal.current_stage == "BUILD" and goal.state_version == 1
+    assert len(bindings) == 1 and bindings[0].completion_event_id is None
+    assert notifications == []
+
+
+def test_direct_status_helper_rejects_structured_terminal_statuses(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import profiles
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    with kb.connect() as conn:
+        created = create_durable_goal(
+            conn,
+            objective="Structured statuses use guarded verbs",
+            origin=GoalOrigin(platform="telegram", chat_id="owner-chat"),
+            board="default",
+            builder_profile="builder",
+            verifier_profile="verifier",
+            reviewer_profile="reviewer",
+            repair_budget=1,
+            review_retry_budget=1,
+        )
+        task = kb.claim_task(conn, created.task_id, claimer="builder")
+        assert task is not None
+        for status in ("archived", "done", "blocked", "scheduled", "running"):
+            assert not _set_status_direct(conn, task.id, status)
+        current = kb.get_task(conn, task.id)
+
+    assert current is not None and current.status == "running"
+
+
 def test_dispatcher_scoped_worker_cannot_archive_own_or_foreign_task(
     kanban_home, monkeypatch
 ):

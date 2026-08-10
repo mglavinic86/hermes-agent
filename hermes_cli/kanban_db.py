@@ -3180,6 +3180,42 @@ def list_durable_goal_task_rows(
     ).fetchall()
 
 
+def _durable_completion_run_is_current(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+) -> bool:
+    """Validate the completion run against live task state inside write_txn."""
+    row = conn.execute(
+        "SELECT t.current_run_id, t.status, r.task_id AS run_task_id, "
+        "r.ended_at, "
+        "(SELECT MAX(id) FROM task_runs WHERE task_id = t.id) AS latest_run_id "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = ? WHERE t.id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        latest_run_id = int(row["latest_run_id"])
+    except (TypeError, ValueError):
+        return False
+    current_run_raw = row["current_run_id"]
+    try:
+        current_run_id = (
+            int(current_run_raw) if current_run_raw is not None else None
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        current_run_id in {None, run_id}
+        and latest_run_id == run_id
+        and row["run_task_id"] == task_id
+        and row["ended_at"] is not None
+        and row["status"] != "running"
+    )
+
+
 def transition_durable_goal_to_successor(
     conn: sqlite3.Connection,
     *,
@@ -3262,6 +3298,12 @@ def transition_durable_goal_to_successor(
             or event["task_id"] != predecessor_task_id
             or event["run_id"] is None
             or int(event["run_id"]) != run_id
+        ):
+            return None
+        if not _durable_completion_run_is_current(
+            conn,
+            task_id=predecessor_task_id,
+            run_id=run_id,
         ):
             return None
         if reserve_budget == "repair":
@@ -3436,6 +3478,12 @@ def transition_durable_goal_to_terminal(
             or event["task_id"] != predecessor_task_id
             or event["run_id"] is None
             or int(event["run_id"]) != run_id
+        ):
+            return False
+        if not _durable_completion_run_is_current(
+            conn,
+            task_id=predecessor_task_id,
+            run_id=run_id,
         ):
             return False
         updated_binding = conn.execute(

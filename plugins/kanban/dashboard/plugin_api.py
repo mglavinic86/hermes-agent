@@ -1014,16 +1014,13 @@ def _parents_blocking_ready(
 def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
 ) -> bool:
-    """Direct status write for drag-drop moves that aren't covered by the
-    structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed.
+    """Direct status write for non-terminal drag-drop moves.
 
-    When this transitions OFF ``running`` to anything other than the
-    terminal verbs above (which own their own run closing), we close the
-    active run with outcome='reclaimed' so attempt history isn't
-    orphaned. ``running -> ready`` via drag-drop is the common case
-    (user yanking a stuck worker back to the queue).
+    Terminal and parked states must use their structured DB verbs so durable
+    authorization, run closure, and lifecycle events cannot be bypassed.
     """
+    if new_status not in {"triage", "todo", "ready"}:
+        return False
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
