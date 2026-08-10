@@ -8,6 +8,9 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
+
+import pytest
 
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
@@ -43,6 +46,42 @@ def test_watcher_loops_are_coroutines():
     # The two long-running watchers are async loops.
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_notifier_watcher)
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_dispatcher_watcher)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_completion_never_delivers_artifacts_from_prose(
+    tmp_path, monkeypatch
+):
+    artifact = tmp_path / "review.txt"
+    artifact.write_text("must not upload", encoding="utf-8")
+    monkeypatch.setattr(
+        "gateway.platforms.base.BasePlatformAdapter.filter_local_delivery_paths",
+        staticmethod(lambda paths: paths),
+    )
+
+    class _Adapter:
+        def extract_local_files(self, text):
+            return ([str(artifact)] if str(artifact) in text else []), text
+
+        async def send_multiple_images(self, **_kwargs):
+            raise AssertionError("reviewer artifact image delivery attempted")
+
+        async def send_video(self, **_kwargs):
+            raise AssertionError("reviewer artifact video delivery attempted")
+
+        async def send_document(self, **_kwargs):
+            raise AssertionError("reviewer artifact document delivery attempted")
+
+    await GatewayKanbanWatchersMixin()._deliver_kanban_artifacts(
+        adapter=_Adapter(),
+        chat_id="test-chat",
+        metadata={},
+        event_payload={
+            "dispatch_role": "reviewer",
+            "summary": f"review complete: {artifact}",
+        },
+        task=SimpleNamespace(result=f"review complete: {artifact}"),
+    )
 
 
 def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
