@@ -167,10 +167,13 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return tid
 
 
@@ -641,10 +644,13 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
@@ -699,10 +705,13 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     # No judge reachable. judge_goal must not even be consulted; if it were,
     # this stub would reject — so reaching "done" proves the probe short-circuit.
@@ -764,10 +773,13 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             conn, title="goal-mode-block-test", assignee="test-worker",
             body="Must achieve X.", goal_mode=True,
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return goal_task_id
 
 
@@ -925,6 +937,136 @@ def test_heartbeat_extends_claim_expires(worker_env):
         f"claim_expires={after} is suspiciously close to now={now}; "
         f"expected at least now + {kb.DEFAULT_CLAIM_TTL_SECONDS // 2}"
     )
+
+
+@pytest.mark.parametrize("entrypoint", ["tool", "auto"])
+@pytest.mark.parametrize(
+    "run_identity",
+    [None, "malformed", "0", "-1", "stale-positive"],
+)
+def test_scoped_heartbeat_invalid_run_identity_has_no_side_effects(
+    worker_env, monkeypatch, entrypoint, run_identity
+):
+    """A scoped worker must prove its exact positive run before any write."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.current_run_id is not None
+        current_run_id = task.current_run_id
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (101, 102, worker_env),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (201, 202, current_run_id),
+        )
+        conn.commit()
+
+        def snapshot():
+            task_row = tuple(
+                conn.execute(
+                    "SELECT status, current_run_id, claim_lock, claim_expires, "
+                    "last_heartbeat_at FROM tasks WHERE id = ?",
+                    (worker_env,),
+                ).fetchone()
+            )
+            run_row = tuple(
+                conn.execute(
+                    "SELECT id, task_id, claim_expires, last_heartbeat_at, ended_at "
+                    "FROM task_runs WHERE id = ?",
+                    (current_run_id,),
+                ).fetchone()
+            )
+            events = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT id, kind, payload, run_id FROM task_events "
+                    "WHERE task_id = ? ORDER BY id",
+                    (worker_env,),
+                )
+            ]
+            return task_row, run_row, events
+
+        before = snapshot()
+
+    if run_identity is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    elif run_identity == "stale-positive":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current_run_id + 999))
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_identity)
+
+    if entrypoint == "tool":
+        result = json.loads(kt._handle_heartbeat({"note": "must not land"}))
+        assert result.get("ok") is not True
+    else:
+        monkeypatch.setattr(kt, "_auto_heartbeat_last_attempt", 0.0)
+        assert kt.heartbeat_current_worker_from_env() is False
+
+    with kb.connect() as conn:
+        task_row = tuple(
+            conn.execute(
+                "SELECT status, current_run_id, claim_lock, claim_expires, "
+                "last_heartbeat_at FROM tasks WHERE id = ?",
+                (worker_env,),
+            ).fetchone()
+        )
+        run_row = tuple(
+            conn.execute(
+                "SELECT id, task_id, claim_expires, last_heartbeat_at, ended_at "
+                "FROM task_runs WHERE id = ?",
+                (current_run_id,),
+            ).fetchone()
+        )
+        events = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT id, kind, payload, run_id FROM task_events "
+                "WHERE task_id = ? ORDER BY id",
+                (worker_env,),
+            )
+        ]
+    assert (task_row, run_row, events) == before
+
+
+def test_explicit_unscoped_heartbeat_keeps_legacy_claim_extension(
+    worker_env, monkeypatch
+):
+    """Non-worker callers may still heartbeat an explicit task without a run token."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        conn.execute(
+            "UPDATE tasks SET claim_expires = 1, last_heartbeat_at = NULL WHERE id = ?",
+            (worker_env,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = 1, last_heartbeat_at = NULL WHERE id = ?",
+            (run_id,),
+        )
+        conn.commit()
+
+    result = json.loads(kt._handle_heartbeat({"task_id": worker_env}))
+    assert result["ok"] is True
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        run = kb.get_run(conn, run_id)
+        events = [event.kind for event in kb.list_events(conn, worker_env)]
+    assert task.claim_expires > 1
+    assert task.last_heartbeat_at is not None
+    assert run.claim_expires == task.claim_expires
+    assert run.last_heartbeat_at == task.last_heartbeat_at
+    assert events[-1] == "heartbeat"
 
 
 def test_comment_happy_path(worker_env):
@@ -2006,6 +2148,139 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     assert d.get("ok") is True
 
 
+@pytest.mark.parametrize("raw_run_id", [None, "malformed", "0", "-1"])
+def test_worker_complete_rejects_missing_or_invalid_run_identity(
+    worker_env, monkeypatch, raw_run_id
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        before = kb.get_task(conn, worker_env)
+        assert before is not None and before.current_run_id is not None
+        current_run_id = before.current_run_id
+
+    if raw_run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", raw_run_id)
+
+    out = kt._handle_complete({"summary": "must not bypass the active run"})
+    assert json.loads(out).get("ok") is not True
+
+    with kb.connect() as conn:
+        after = kb.get_task(conn, worker_env)
+    assert after is not None
+    assert after.status == "running"
+    assert after.current_run_id == current_run_id
+
+
+@pytest.mark.parametrize(
+    "run_identity",
+    [None, "malformed", "0", "-1", "stale", "foreign"],
+)
+def test_goal_complete_rejects_invalid_scoped_run_before_auxiliary_judge(
+    monkeypatch, tmp_path, run_identity
+):
+    """Invalid worker identity must not spend judge calls or mutate completion state."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    task_id = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        current_run_id = task.current_run_id
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "billable-judge.txt"
+        artifact.write_text("must remain scratch-only", encoding="utf-8")
+
+        foreign_task_id = kb.create_task(conn, title="foreign run", assignee="other")
+        foreign_task = kb.claim_task(conn, foreign_task_id, claimer="other")
+        assert foreign_task is not None and foreign_task.current_run_id is not None
+        foreign_run_id = foreign_task.current_run_id
+
+        def snapshot():
+            return (
+                tuple(conn.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()),
+                tuple(conn.execute(
+                    "SELECT * FROM task_runs WHERE id = ?", (current_run_id,)
+                ).fetchone()),
+                [tuple(row) for row in conn.execute(
+                    "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                )],
+                [tuple(row) for row in conn.execute(
+                    "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                )],
+                [tuple(row) for row in conn.execute(
+                    "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY id",
+                    (task_id,),
+                )],
+            )
+
+        before = snapshot()
+
+    if run_identity is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    elif run_identity == "stale":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current_run_id + 100_000))
+    elif run_identity == "foreign":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(foreign_run_id))
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_identity)
+
+    auxiliary_calls: list[str] = []
+
+    def billable_availability_probe():
+        auxiliary_calls.append("availability")
+        return True
+
+    def billable_judge(*_args, **_kwargs):
+        auxiliary_calls.append("judge")
+        return "done", "accepted", False, None, False
+
+    monkeypatch.setattr(kt, "_goal_judge_available", billable_availability_probe)
+    monkeypatch.setattr(kt, "judge_goal", billable_judge)
+
+    result = json.loads(kt._handle_complete({
+        "summary": "claiming goal completion",
+        "artifacts": [str(artifact)],
+    }))
+
+    assert result.get("ok") is not True
+    assert auxiliary_calls == []
+    with kb.connect() as conn:
+        after = (
+            tuple(conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()),
+            tuple(conn.execute(
+                "SELECT * FROM task_runs WHERE id = ?", (current_run_id,)
+            ).fetchone()),
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )],
+        )
+    assert after == before
+    attachment_dir = kb.task_attachments_dir(task_id)
+    assert not attachment_dir.exists() or list(attachment_dir.iterdir()) == []
+    assert artifact.read_text(encoding="utf-8") == "must remain scratch-only"
+
+
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     """Orchestrator profiles (no HERMES_KANBAN_TASK) can still complete
     any task via explicit task_id. The check only applies to workers."""
@@ -2280,8 +2555,11 @@ def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
     # Seed the alt board with a claimed task.
     with kb.connect(board="alt") as conn:
         tid = kb.create_task(conn, title="alt hb", assignee="alt-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     from tools import kanban_tools as kt
     out = kt._handle_heartbeat({"note": "alive on alt", "board": "alt"})

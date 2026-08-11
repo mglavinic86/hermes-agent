@@ -2651,6 +2651,214 @@ class GatewaySlashCommandsMixin:
         args = (event.get_command_args() or "").strip()
         lower = args.lower()
 
+        # Explicit opt-in deterministic Kanban supervisor. Keep this ahead of
+        # GoalManager lookup: durable goals do not create a standing LLM goal,
+        # enqueue a synthetic user turn, or enter the legacy judge loop.
+        if lower == "durable" or lower.startswith("durable "):
+            objective = args[len("durable"):].strip()
+            if not objective:
+                return "Usage: /goal durable <objective>"
+            source = event.source
+            platform = getattr(source, "platform", None) if source else None
+            platform_name = (
+                getattr(platform, "value", platform) if platform is not None else ""
+            )
+            chat_id = str(getattr(source, "chat_id", "") or "").strip()
+            if not platform_name or not chat_id:
+                return (
+                    "Durable goals require a gateway chat origin. "
+                    "Use /goal durable from a connected gateway platform."
+                )
+            try:
+                from hermes_cli.config import load_config
+
+                config = load_config()
+            except Exception as exc:
+                logger.warning("durable goal config load failed: %s", exc)
+                return "Durable goal unavailable: kanban configuration could not be loaded."
+            kanban_cfg = config.get("kanban", {}) if isinstance(config, dict) else {}
+            durable_cfg = (
+                kanban_cfg.get("durable_goals", {})
+                if isinstance(kanban_cfg, dict)
+                else {}
+            )
+            required_profiles = {
+                "builder_profile": str(durable_cfg.get("builder_profile") or "").strip(),
+                "verifier_profile": str(durable_cfg.get("verifier_profile") or "").strip(),
+                "reviewer_profile": str(durable_cfg.get("reviewer_profile") or "").strip(),
+            }
+            missing = [name for name, value in required_profiles.items() if not value]
+            if missing:
+                return (
+                    "Durable goal unavailable: configure kanban.durable_goals."
+                    + ", kanban.durable_goals.".join(missing)
+                    + " in config.yaml."
+                )
+            board = str(durable_cfg.get("board") or "").strip() or None
+            durable_parts = objective.split()
+            if durable_parts and durable_parts[0].lower() == "complete":
+                if len(durable_parts) != 3:
+                    return (
+                        "Usage: /goal durable complete <goal-id> "
+                        "<candidate-sha>"
+                    )
+
+                def _complete_durable_goal() -> bool:
+                    from hermes_cli import kanban_db as _kb
+                    from hermes_cli.kanban_goal_supervisor import (
+                        GoalOrigin,
+                        mark_durable_goal_completed_by_owner,
+                    )
+
+                    resolved_board = board or _kb.get_current_board()
+                    with _kb.connect_closing(board=resolved_board) as conn:
+                        return mark_durable_goal_completed_by_owner(
+                            conn,
+                            goal_id=durable_parts[1],
+                            origin=GoalOrigin(
+                                platform=str(platform_name).lower(),
+                                chat_id=chat_id,
+                                thread_id=(
+                                    str(getattr(source, "thread_id", "") or "")
+                                    or None
+                                ),
+                                user_id=(
+                                    str(getattr(source, "user_id", "") or "")
+                                    or None
+                                ),
+                            ),
+                            candidate_sha=durable_parts[2],
+                        )
+
+                completed = await asyncio.to_thread(_complete_durable_goal)
+                if not completed:
+                    return (
+                        "Durable goal completion refused: goal must be "
+                        "READY_FOR_OWNER and origin/candidate SHA must match."
+                    )
+                return (
+                    f"Durable goal {durable_parts[1]} marked COMPLETED by owner; "
+                    "no merge, push, or deploy was performed."
+                )
+            reviewer_skill_digest = str(
+                durable_cfg.get("reviewer_skill_digest") or ""
+            ).strip()
+            import re
+
+            if not re.fullmatch(r"[0-9a-f]{64}", reviewer_skill_digest):
+                return (
+                    "Durable goal unavailable: configure "
+                    "kanban.durable_goals.reviewer_skill_digest as lowercase "
+                    "64-hex in config.yaml."
+                )
+            try:
+                repair_budget = int(durable_cfg.get("repair_budget", 1))
+                review_retry_budget = int(
+                    durable_cfg.get("review_retry_budget", 1)
+                )
+            except (TypeError, ValueError):
+                return "Durable goal unavailable: retry budgets must be integers."
+            try:
+                delivery_metadata = self._thread_metadata_for_source(
+                    source, self._reply_anchor_for_event(event)
+                )
+            except Exception:
+                delivery_metadata = None
+
+            def _create_durable_goal():
+                from hermes_cli import kanban_db as _kb
+                from hermes_cli.kanban_goal_supervisor import (
+                    GoalOrigin,
+                    check_durable_goal_runtime,
+                    create_durable_goal,
+                )
+
+                resolved_board = board or _kb.get_current_board()
+                with _kb.connect_closing(board=resolved_board) as conn:
+                    compatibility = check_durable_goal_runtime(conn)
+                    if not compatibility.compatible:
+                        raise ValueError(
+                            "incompatible singleton dispatcher "
+                            f"({compatibility.reason})"
+                        )
+                    board_workdir = str(
+                        _kb.read_board_metadata(resolved_board).get(
+                            "default_workdir"
+                        )
+                        or ""
+                    ).strip()
+                    if not board_workdir:
+                        raise ValueError(
+                            "board default_workdir is required for the durable "
+                            "goal's isolated worktree"
+                        )
+                    workdir_path = Path(board_workdir).expanduser()
+                    if not workdir_path.is_absolute() or not workdir_path.is_dir():
+                        raise ValueError(
+                            "board default_workdir must be an existing absolute "
+                            "git checkout"
+                        )
+                    import subprocess
+
+                    git_probe = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(workdir_path),
+                            "rev-parse",
+                            "--show-toplevel",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    if git_probe.returncode != 0:
+                        raise ValueError(
+                            "board default_workdir must be an existing absolute "
+                            "git checkout"
+                        )
+                    return create_durable_goal(
+                        conn,
+                        objective=objective,
+                        origin=GoalOrigin(
+                            platform=str(platform_name).lower(),
+                            chat_id=chat_id,
+                            chat_type=str(getattr(source, "chat_type", "") or "") or None,
+                            thread_id=str(getattr(source, "thread_id", "") or "") or None,
+                            user_id=str(getattr(source, "user_id", "") or "") or None,
+                            message_id=str(event.message_id or "") or None,
+                            notifier_profile=(
+                                str(getattr(source, "profile", "") or "").strip()
+                                or self._active_profile_name()
+                            ),
+                            delivery_metadata=delivery_metadata,
+                        ),
+                        board=resolved_board,
+                        builder_profile=required_profiles["builder_profile"],
+                        verifier_profile=required_profiles["verifier_profile"],
+                        reviewer_profile=required_profiles["reviewer_profile"],
+                        reviewer_skill_digest=reviewer_skill_digest,
+                        repair_budget=repair_budget,
+                        review_retry_budget=review_retry_budget,
+                    )
+
+            try:
+                created = await asyncio.to_thread(_create_durable_goal)
+            except ValueError as exc:
+                return f"Durable goal unavailable: {exc}"
+            except Exception:
+                logger.exception("durable goal creation failed")
+                return (
+                    "Durable goal unavailable due to an internal error. "
+                    "No goal was created."
+                )
+            return (
+                f"Durable goal created {created.goal_id} (BUILD task "
+                f"{created.task_id}). Progress is supervised by Kanban; "
+                "no chat continuation was queued."
+            )
+
         mgr, session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
             return t("gateway.goal.unavailable")
@@ -2725,7 +2933,6 @@ class GatewaySlashCommandsMixin:
             if not objective:
                 return "Usage: /goal draft <objective in plain language>"
             try:
-                import asyncio
                 from hermes_cli.goals import draft_contract
 
                 draft_contract_obj = await asyncio.get_running_loop().run_in_executor(

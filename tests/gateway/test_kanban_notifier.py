@@ -1,11 +1,22 @@
 import asyncio
+import os
 import sqlite3
+import subprocess
 from pathlib import Path
 
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_goal_supervisor import (
+    DURABLE_GOAL_PROTOCOL_VERSION,
+    GoalOrigin,
+    create_durable_goal,
+    get_durable_goal,
+    list_durable_goal_tasks,
+    list_goal_notifications,
+    supervise_goal_once,
+)
 
 
 class RecordingAdapter:
@@ -57,6 +68,565 @@ def _create_completed_subscription(summary="done once"):
         return tid
     finally:
         conn.close()
+
+
+def _insert_goal_outbox(conn, *, goal_id="g_notify_once", kind="READY_FOR_OWNER"):
+    now = 1_700_000_000
+    conn.execute(
+        """
+        INSERT INTO kanban_goals (
+            id, objective, status, current_stage, schema_version,
+            protocol_version, board_slug, origin_platform, origin_chat_id,
+            origin_thread_id, builder_profile, verifier_profile,
+            reviewer_profile, repair_budget, review_retry_budget,
+            created_at, updated_at
+        ) VALUES (?, 'notify owner', 'READY_FOR_OWNER', 'READY_FOR_OWNER',
+                  1, 1, 'default', 'telegram', 'owner-chat', '',
+                  'builder', 'verifier', 'reviewer', 1, 1, ?, ?)
+        """,
+        (goal_id, now, now),
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_goal_notification_outbox (
+            goal_id, kind, dedupe_key, payload, platform, chat_id,
+            thread_id, created_at
+        ) VALUES (?, ?, ?, ?, 'telegram', 'owner-chat', '', ?)
+        """,
+        (
+            goal_id,
+            kind,
+            f"durable-goal:{goal_id}:{kind}",
+            '{"candidate_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
+            now,
+        ),
+    )
+    conn.commit()
+    return goal_id
+
+
+def _init_durable_goal_board(tmp_path, monkeypatch, db_name="durable-goal.db"):
+    db_path = tmp_path / db_name
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--allow-empty", "-m", "base"],
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        },
+        capture_output=True,
+    )
+    kb.write_board_metadata("default", default_workdir=str(repo))
+    return db_path
+
+
+def test_goal_outbox_delivers_once_and_acks_across_notifier_replay(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "goal-outbox-once.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        goal_id = _insert_goal_outbox(conn)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert goal_id in adapter.sent[0]["text"]
+    assert "READY_FOR_OWNER" in adapter.sent[0]["text"]
+    conn = kb.connect()
+    try:
+        [row] = kb.list_durable_goal_notification_rows(conn, goal_id)
+        assert row["delivered_at"] is not None
+        assert row["delivery_attempts"] == 1
+    finally:
+        conn.close()
+
+
+def test_goal_outbox_expired_claim_reclaims_delivers_and_acks_once(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "goal-outbox-expired-claim.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        goal_id = _insert_goal_outbox(conn, goal_id="g_expired_claim")
+        [claimed] = kb.claim_pending_durable_goal_notifications(
+            conn,
+            now=100,
+            claim_timeout_seconds=120,
+        )
+        assert claimed["claim_token"]
+        assert kb.count_pending_durable_goal_notifications(
+            db_path=db_path,
+            now=119,
+            claim_timeout_seconds=120,
+        ) == 1
+        assert kb.count_pending_durable_goal_notifications(
+            db_path=db_path,
+            now=221,
+            claim_timeout_seconds=120,
+        ) == 1
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(kb.time, "time", lambda: 221)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert goal_id in adapter.sent[0]["text"]
+    conn = kb.connect()
+    try:
+        [row] = kb.list_durable_goal_notification_rows(conn, goal_id)
+        goal = kb.get_durable_goal_row(conn, goal_id)
+        assert row["delivered_at"] is not None
+        assert row["claim_token"] is None
+        assert row["delivery_attempts"] == 2
+        assert goal["status"] == "READY_FOR_OWNER"
+    finally:
+        conn.close()
+
+
+def test_goal_outbox_send_failure_retries_without_reverting_goal(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "goal-outbox-retry.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        goal_id = _insert_goal_outbox(conn, goal_id="g_retry_owner")
+    finally:
+        conn.close()
+
+    clock = {"now": 10_000}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+    adapter = FailingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.attempts == 1
+    conn = kb.connect()
+    try:
+        [row] = kb.list_durable_goal_notification_rows(conn, goal_id)
+        goal = kb.get_durable_goal_row(conn, goal_id)
+        assert row["delivered_at"] is None
+        assert row["claim_token"] is None
+        assert row["delivery_attempts"] == 1
+        assert row["next_attempt_at"] == (
+            clock["now"] + kb.DURABLE_GOAL_NOTIFICATION_RETRY_BASE_SECONDS
+        )
+        assert "simulated send failure" in row["last_error"]
+        assert goal["status"] == "READY_FOR_OWNER"
+    finally:
+        conn.close()
+
+    clock["now"] = int(row["next_attempt_at"])
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.attempts == 2
+
+
+def test_goal_outbox_retries_beyond_thirteen_then_recovers_without_duplicate(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "goal-outbox-indefinite-retry.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        goal_id = _insert_goal_outbox(conn, goal_id="g_indefinite_retry")
+
+    clock = {"now": 20_000}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+    unavailable_adapter = FailingAdapter()
+
+    for expected_attempts in range(1, 14):
+        asyncio.run(
+            _run_one_notifier_tick(
+                monkeypatch,
+                _make_runner(unavailable_adapter),
+            )
+        )
+        with kb.connect_closing() as conn:
+            [row] = kb.list_durable_goal_notification_rows(conn, goal_id)
+        assert row["delivered_at"] is None
+        assert row["delivery_attempts"] == expected_attempts
+        assert row["next_attempt_at"] > clock["now"]
+        if expected_attempts < 13:
+            clock["now"] = int(row["next_attempt_at"])
+
+    assert unavailable_adapter.attempts == 13
+    assert kb.count_pending_durable_goal_notifications(
+        db_path=db_path,
+        max_attempts=1,
+        now=clock["now"],
+    ) == 1
+    with kb.connect_closing() as conn:
+        assert kb.claim_pending_durable_goal_notifications(
+            conn,
+            max_attempts=1,
+            now=int(row["next_attempt_at"]) - 1,
+        ) == []
+
+    clock["now"] = int(row["next_attempt_at"])
+    recovered_adapter = RecordingAdapter()
+    asyncio.run(
+        _run_one_notifier_tick(monkeypatch, _make_runner(recovered_adapter))
+    )
+    asyncio.run(
+        _run_one_notifier_tick(monkeypatch, _make_runner(recovered_adapter))
+    )
+
+    assert len(recovered_adapter.sent) == 1
+    assert goal_id in recovered_adapter.sent[0]["text"]
+    with kb.connect_closing() as conn:
+        [row] = kb.list_durable_goal_notification_rows(conn, goal_id)
+    assert row["delivered_at"] is not None
+    assert row["delivery_attempts"] == 14
+    assert row["next_attempt_at"] is None
+    assert kb.count_pending_durable_goal_notifications(db_path=db_path) == 0
+
+
+def test_goal_outbox_failure_backoff_delays_increases_and_caps(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "goal-outbox-backoff.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        goal_id = _insert_goal_outbox(conn, goal_id="g_backoff_owner")
+        now = 10_000
+
+        [claimed] = kb.claim_pending_durable_goal_notifications(conn, now=now)
+        assert kb.release_durable_goal_notification_claim(
+            conn,
+            notification_id=int(claimed["id"]),
+            claim_token=str(claimed["claim_token"]),
+            error="first failure",
+            now=now,
+        )
+        [row] = kb.list_durable_goal_notification_rows(conn, goal_id)
+        assert row["next_attempt_at"] == (
+            now + kb.DURABLE_GOAL_NOTIFICATION_RETRY_BASE_SECONDS
+        )
+        assert kb.count_pending_durable_goal_notifications(
+            db_path=db_path,
+            now=now,
+        ) == 1
+        assert kb.claim_pending_durable_goal_notifications(
+            conn,
+            now=int(row["next_attempt_at"]) - 1,
+        ) == []
+
+        now = int(row["next_attempt_at"])
+        [claimed] = kb.claim_pending_durable_goal_notifications(conn, now=now)
+        assert kb.release_durable_goal_notification_claim(
+            conn,
+            notification_id=int(claimed["id"]),
+            claim_token=str(claimed["claim_token"]),
+            error="second failure",
+            now=now,
+        )
+        [row] = kb.list_durable_goal_notification_rows(conn, goal_id)
+        assert row["next_attempt_at"] - now == (
+            kb.DURABLE_GOAL_NOTIFICATION_RETRY_BASE_SECONDS * 2
+        )
+
+        while int(row["delivery_attempts"]) < 13:
+            now = int(row["next_attempt_at"])
+            [claimed] = kb.claim_pending_durable_goal_notifications(conn, now=now)
+            assert kb.release_durable_goal_notification_claim(
+                conn,
+                notification_id=int(claimed["id"]),
+                claim_token=str(claimed["claim_token"]),
+                error="repeated failure",
+                now=now,
+            )
+            [row] = kb.list_durable_goal_notification_rows(conn, goal_id)
+
+        assert row["delivery_attempts"] == 13
+        assert (
+            row["next_attempt_at"] - now
+            == kb.DURABLE_GOAL_NOTIFICATION_RETRY_CAP_SECONDS
+        )
+        assert kb.claim_pending_durable_goal_notifications(
+            conn,
+            now=int(row["next_attempt_at"]) - 1,
+        ) == []
+
+
+def test_goal_outbox_legacy_row_migrates_due_and_immediately_claimable(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "goal-outbox-legacy.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        goal_id = _insert_goal_outbox(conn, goal_id="g_legacy_outbox")
+        conn.execute(
+            "UPDATE kanban_goal_notification_outbox "
+            "SET delivery_attempts = 12 WHERE goal_id = ?",
+            (goal_id,),
+        )
+        conn.execute("DROP INDEX IF EXISTS idx_goal_outbox_due")
+        conn.execute("DROP INDEX IF EXISTS idx_goal_outbox_pending")
+        conn.execute(
+            "ALTER TABLE kanban_goal_notification_outbox "
+            "RENAME TO kanban_goal_notification_outbox_newer"
+        )
+        conn.execute(
+            """
+            CREATE TABLE kanban_goal_notification_outbox (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                goal_id           TEXT NOT NULL,
+                kind              TEXT NOT NULL,
+                dedupe_key        TEXT NOT NULL UNIQUE,
+                payload           TEXT NOT NULL,
+                platform          TEXT NOT NULL,
+                chat_id           TEXT NOT NULL,
+                chat_type         TEXT,
+                thread_id         TEXT NOT NULL DEFAULT '',
+                user_id           TEXT,
+                notifier_profile  TEXT,
+                delivery_metadata TEXT,
+                claimed_at        INTEGER,
+                claim_token       TEXT,
+                delivered_at      INTEGER,
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                last_error        TEXT,
+                created_at        INTEGER NOT NULL,
+                FOREIGN KEY (goal_id) REFERENCES kanban_goals(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO kanban_goal_notification_outbox (
+                id, goal_id, kind, dedupe_key, payload, platform, chat_id,
+                chat_type, thread_id, user_id, notifier_profile,
+                delivery_metadata, claimed_at, claim_token, delivered_at,
+                delivery_attempts, last_error, created_at
+            )
+            SELECT id, goal_id, kind, dedupe_key, payload, platform, chat_id,
+                   chat_type, thread_id, user_id, notifier_profile,
+                   delivery_metadata, claimed_at, claim_token, delivered_at,
+                   delivery_attempts, last_error, created_at
+              FROM kanban_goal_notification_outbox_newer
+            """
+        )
+        conn.execute("DROP TABLE kanban_goal_notification_outbox_newer")
+        conn.commit()
+
+    kb.init_db()
+
+    with kb.connect_closing() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(kanban_goal_notification_outbox)"
+            )
+        }
+        [row] = kb.list_durable_goal_notification_rows(conn, goal_id)
+        assert "next_attempt_at" in columns
+        assert row["next_attempt_at"] is None
+        [claimed] = kb.claim_pending_durable_goal_notifications(conn, now=30_000)
+        assert claimed["goal_id"] == goal_id
+        assert claimed["delivery_attempts"] == 13
+
+
+def test_durable_goal_acceptance_chain_delivers_once_without_inbound_replay(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import profiles
+
+    _init_durable_goal_board(tmp_path, monkeypatch, "durable-acceptance.db")
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    candidate_sha = "a" * 40
+    inbound_user_messages = ["synthetic /goal durable ship deterministic candidate"]
+    with kb.connect() as conn:
+        assert len(inbound_user_messages) == 1
+        created = create_durable_goal(
+            conn,
+            objective="Ship a deterministic candidate without merge or deploy",
+            origin=GoalOrigin(platform="telegram", chat_id="owner-chat"),
+            board="default",
+            builder_profile="builder",
+            verifier_profile="verifier",
+            reviewer_profile="reviewer",
+            repair_budget=1,
+            review_retry_budget=1,
+        )
+        inbound_user_messages.clear()
+
+        def _spawn_failure(*_args, **_kwargs):
+            raise RuntimeError("build worker gave up before producing a candidate")
+
+        gave_up = kb.dispatch_once(
+            conn,
+            board="default",
+            spawn_fn=_spawn_failure,
+            failure_limit=1,
+            durable_goal_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        assert gave_up.auto_blocked == [created.task_id]
+        assert inbound_user_messages == []
+
+        repair_result = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        assert repair_result.action == "CREATED_SUCCESSOR"
+        repair_replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        assert repair_replay.action == "NOOP"
+        assert [
+            task.stage for task in list_durable_goal_tasks(conn, created.goal_id)
+        ] == ["BUILD", "REPAIR_BUILD_1"]
+
+        repair = kb.claim_task(conn, repair_result.task_id, claimer="builder")
+        assert repair is not None and repair.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            repair.id,
+            summary="repair produced candidate",
+            metadata={
+                "durable_goal": {
+                    "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
+                    "stage": "BUILD",
+                    "run_id": repair.current_run_id,
+                    "candidate_sha": candidate_sha,
+                    "outcome": "BUILT",
+                }
+            },
+            expected_run_id=repair.current_run_id,
+        )
+        verify_result = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        assert verify_result.action == "CREATED_SUCCESSOR"
+        assert [
+            task.stage for task in list_durable_goal_tasks(conn, created.goal_id)
+        ] == ["BUILD", "REPAIR_BUILD_1", "VERIFY"]
+
+        verify = kb.claim_task(conn, verify_result.task_id, claimer="verifier")
+        assert verify is not None and verify.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            verify.id,
+            summary="candidate passed verification",
+            metadata={
+                "durable_goal": {
+                    "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
+                    "stage": "VERIFY",
+                    "run_id": verify.current_run_id,
+                    "candidate_sha": candidate_sha,
+                    "verdict": "PASS",
+                }
+            },
+            expected_run_id=verify.current_run_id,
+        )
+        review_result = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        assert review_result.action == "CREATED_SUCCESSOR"
+        review_task = kb.get_task(conn, review_result.task_id)
+        assert review_task is not None
+        assert review_task.skills == ["immutable-change-reviews"]
+
+        review = kb.claim_review_task(
+            conn, review_result.task_id, claimer="reviewer", allow_durable=True
+        )
+        assert review is not None and review.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            review.id,
+            summary="review approved candidate",
+            metadata={
+                "_kanban_dispatch_role": "reviewer",
+                "durable_goal": {
+                    "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
+                    "stage": "REVIEW",
+                    "run_id": review.current_run_id,
+                    "candidate_sha": candidate_sha,
+                    "verdict": "APPROVE",
+                },
+            },
+            expected_run_id=review.current_run_id,
+        )
+        ready = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        ready_replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+        tasks = list_durable_goal_tasks(conn, created.goal_id)
+
+    assert ready.action == "READY_FOR_OWNER"
+    assert ready_replay.action == "NOOP"
+    assert inbound_user_messages == []
+    assert goal is not None and goal.status == "READY_FOR_OWNER"
+    assert [task.stage for task in tasks] == [
+        "BUILD",
+        "REPAIR_BUILD_1",
+        "VERIFY",
+        "REVIEW",
+    ]
+    assert [notification.kind for notification in notifications] == [
+        "READY_FOR_OWNER"
+    ]
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert created.goal_id in adapter.sent[0]["text"]
+    with kb.connect() as conn:
+        [row] = kb.list_durable_goal_notification_rows(conn, created.goal_id)
+        assert row["delivered_at"] is not None
+        assert row["delivery_attempts"] == 1
+        assert [
+            task.stage for task in list_durable_goal_tasks(conn, created.goal_id)
+        ] == ["BUILD", "REPAIR_BUILD_1", "VERIFY", "REVIEW"]
 
 
 def _unseen_terminal_events(tid):

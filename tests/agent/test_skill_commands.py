@@ -38,6 +38,49 @@ description: Description for {name}.
     return skill_dir
 
 
+def test_pinned_skill_config_label_hides_profile_root(tmp_path, monkeypatch):
+    from agent.skill_commands import _build_skill_message
+    from agent import skill_utils
+
+    profile_home = tmp_path / "private-review-profile"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(skill_utils, "parse_frontmatter", lambda _raw: ({}, "body"))
+    monkeypatch.setattr(
+        skill_utils,
+        "extract_skill_config_vars",
+        lambda _frontmatter: {"review_mode": {"default": "strict"}},
+    )
+    monkeypatch.setattr(
+        skill_utils,
+        "resolve_skill_config_values",
+        lambda _vars: {"review_mode": "strict"},
+    )
+
+    pinned = _build_skill_message(
+        {
+            "name": "immutable-change-reviews",
+            "content": "review bytes",
+            "raw_content": "frontmatter and review bytes",
+            "_pinned_snapshot_verified": True,
+        },
+        profile_home / "skills" / "immutable-change-reviews",
+        "preloaded",
+    )
+    ordinary = _build_skill_message(
+        {
+            "name": "ordinary-skill",
+            "content": "ordinary bytes",
+            "raw_content": "frontmatter and ordinary bytes",
+        },
+        profile_home / "skills" / "ordinary-skill",
+        "preloaded",
+    )
+
+    assert "Skill config (from dispatcher profile config)" in pinned
+    assert str(profile_home) not in pinned
+    assert f"Skill config (from {profile_home}/config.yaml)" in ordinary
+
+
 def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Path:
     """Create a category symlink under skills_dir pointing outside the tree."""
     external_category = linked_root / category

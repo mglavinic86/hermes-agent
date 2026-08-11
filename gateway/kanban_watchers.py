@@ -11,8 +11,10 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +25,35 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def _prepare_durable_goal_board_tick(
+    conn,
+    *,
+    board: str,
+    runtime_id: str,
+    lease_seconds: int,
+):
+    """Stamp singleton compatibility, then advance terminal goal events once."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli.kanban_goal_supervisor import (
+        DURABLE_GOAL_PROTOCOL_VERSION,
+        DURABLE_GOAL_SCHEMA_VERSION,
+        supervise_board_once,
+    )
+
+    _kb.upsert_durable_goal_runtime(
+        conn,
+        runtime_id=runtime_id,
+        schema_version=DURABLE_GOAL_SCHEMA_VERSION,
+        protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        lease_seconds=lease_seconds,
+    )
+    return supervise_board_once(
+        conn,
+        board=board,
+        runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+    )
 
 
 def _resolve_auto_decompose_settings(
@@ -262,9 +293,15 @@ class GatewayKanbanWatchersMixin:
                         # checkpoint traffic) is exactly the per-tick cost
                         # this skip avoids.
                         try:
-                            if _kb.count_notify_subs(board=slug) == 0:
+                            sub_count = _kb.count_notify_subs(board=slug)
+                            goal_outbox_count = (
+                                _kb.count_pending_durable_goal_notifications(
+                                    board=slug
+                                )
+                            )
+                            if sub_count == 0 and goal_outbox_count == 0:
                                 logger.debug(
-                                    "kanban notifier: board %s has no subscriptions; skipping open",
+                                    "kanban notifier: board %s has no subscriptions or goal outbox; skipping open",
                                     slug,
                                 )
                                 continue
@@ -292,6 +329,27 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+                            for row in _kb.claim_pending_durable_goal_notifications(conn):
+                                platform = (row["platform"] or "").lower()
+                                if platform not in active_platforms:
+                                    try:
+                                        _kb.release_durable_goal_notification_claim(
+                                            conn,
+                                            notification_id=int(row["id"]),
+                                            claim_token=str(row["claim_token"]),
+                                            error="adapter not connected",
+                                        )
+                                    except Exception:
+                                        logger.debug(
+                                            "kanban notifier: could not release goal outbox claim",
+                                            exc_info=True,
+                                        )
+                                    continue
+                                deliveries.append({
+                                    "goal_notification": row,
+                                    "board": slug,
+                                })
+
                             subs = _kb.list_notify_subs(conn)
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
@@ -350,6 +408,77 @@ class GatewayKanbanWatchersMixin:
 
                 deliveries = await asyncio.to_thread(_collect)
                 for d in deliveries:
+                    goal_notification = d.get("goal_notification")
+                    if goal_notification is not None:
+                        board_slug = d.get("board")
+                        platform_str = (goal_notification["platform"] or "").lower()
+                        try:
+                            plat = _Platform(platform_str)
+                        except ValueError:
+                            await asyncio.to_thread(
+                                self._kanban_goal_outbox_fail,
+                                goal_notification,
+                                "unknown platform",
+                                board_slug,
+                            )
+                            continue
+                        sub_profile = goal_notification["notifier_profile"] or ""
+                        adapter = self._authorization_adapter(plat, sub_profile or None)
+                        if adapter is None:
+                            await asyncio.to_thread(
+                                self._kanban_goal_outbox_fail,
+                                goal_notification,
+                                "adapter disconnected",
+                                board_slug,
+                            )
+                            continue
+                        metadata: dict[str, Any] = {}
+                        if goal_notification["delivery_metadata"]:
+                            try:
+                                decoded = json.loads(
+                                    str(goal_notification["delivery_metadata"])
+                                )
+                                if isinstance(decoded, dict):
+                                    metadata = decoded
+                            except Exception:
+                                metadata = {}
+                        if goal_notification["thread_id"] and not metadata.get("thread_id"):
+                            metadata["thread_id"] = goal_notification["thread_id"]
+                        try:
+                            payload_preview = ""
+                            if goal_notification["payload"]:
+                                payload_preview = str(goal_notification["payload"])[:300]
+                            msg = (
+                                f"Durable goal {goal_notification['goal_id']} "
+                                f"{goal_notification['kind']}"
+                            )
+                            if payload_preview:
+                                msg += f"\n{payload_preview}"
+                            send_res = await adapter.send(
+                                goal_notification["chat_id"],
+                                msg,
+                                metadata=metadata,
+                            )
+                            if getattr(send_res, "success", True) is False:
+                                raise RuntimeError(
+                                    "adapter send() reported failure: "
+                                    f"{getattr(send_res, 'error', None) or 'unknown error'}"
+                                )
+                        except Exception as exc:
+                            await asyncio.to_thread(
+                                self._kanban_goal_outbox_fail,
+                                goal_notification,
+                                str(exc),
+                                board_slug,
+                            )
+                            continue
+                        await asyncio.to_thread(
+                            self._kanban_goal_outbox_ack,
+                            goal_notification,
+                            board_slug,
+                        )
+                        continue
+
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
@@ -835,6 +964,35 @@ class GatewayKanbanWatchersMixin:
         finally:
             conn.close()
 
+    def _kanban_goal_outbox_ack(self, row, board: Optional[str] = None) -> None:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.mark_durable_goal_notification_delivered(
+                conn,
+                notification_id=int(row["id"]),
+                claim_token=str(row["claim_token"]),
+            )
+        finally:
+            conn.close()
+
+    def _kanban_goal_outbox_fail(
+        self, row, error: str, board: Optional[str] = None
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.release_durable_goal_notification_claim(
+                conn,
+                notification_id=int(row["id"]),
+                claim_token=str(row["claim_token"]),
+                error=error,
+            )
+        finally:
+            conn.close()
+
     async def _deliver_kanban_artifacts(
         self,
         *,
@@ -1036,6 +1194,8 @@ class GatewayKanbanWatchersMixin:
             )
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
+        durable_runtime_id = f"{os.getpid()}:{secrets.token_hex(12)}"
+        durable_runtime_lease_seconds = max(30, int(interval * 3))
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
@@ -1224,6 +1384,17 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                from hermes_cli.kanban_goal_supervisor import (
+                    DURABLE_GOAL_PROTOCOL_VERSION,
+                )
+
+                _prepare_durable_goal_board_tick(
+                    conn,
+                    board=slug,
+                    runtime_id=durable_runtime_id,
+                    lease_seconds=durable_runtime_lease_seconds,
+                )
+
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
@@ -1233,6 +1404,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    durable_goal_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

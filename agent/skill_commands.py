@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_home
 from agent.skill_preprocessing import (
     expand_inline_shell as _expand_inline_shell,
     load_skills_config as _load_skills_config,
@@ -213,14 +213,21 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     skill_name = str(loaded_skill.get("name") or normalized)
     skill_path = str(loaded_skill.get("path") or "")
     skill_dir = None
+    if loaded_skill.get("_pinned_snapshot_verified"):
+        from agent.skill_integrity import pinned_skill_digests_from_env
+
+        pinned = pinned_skill_digests_from_env()
+        if skill_name not in pinned:
+            return None
+        skill_dir = get_hermes_home() / "skills" / skill_name
     # Prefer the absolute skill_dir returned by skill_view() — this is
     # correct for both local and external skills.  Fall back to the old
     # SKILLS_DIR-relative reconstruction only when skill_dir is absent
     # (e.g. legacy skill_view responses).
     abs_skill_dir = loaded_skill.get("skill_dir")
-    if abs_skill_dir:
+    if skill_dir is None and abs_skill_dir:
         skill_dir = Path(abs_skill_dir)
-    elif skill_path:
+    elif skill_dir is None and skill_path:
         try:
             skill_dir = SKILLS_DIR / Path(skill_path).parent
         except Exception:
@@ -258,7 +265,12 @@ def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None
         if not resolved:
             return
 
-        lines = ["", f"[Skill config (from {display_hermes_home()}/config.yaml):"]
+        config_source = (
+            "dispatcher profile config"
+            if loaded_skill.get("_pinned_snapshot_verified")
+            else f"{display_hermes_home()}/config.yaml"
+        )
+        lines = ["", f"[Skill config (from {config_source}):"]
         for key, value in resolved.items():
             display_val = str(value) if value else "(not set)"
             lines.append(f"  {key} = {display_val}")
@@ -280,14 +292,18 @@ def _build_skill_message(
     from tools.skills_tool import SKILLS_DIR
 
     content = str(loaded_skill.get("content") or "")
+    pinned_snapshot_verified = bool(loaded_skill.get("_pinned_snapshot_verified"))
 
     # ── Template substitution and inline-shell expansion ──
     # Done before anything else so downstream blocks (setup notes,
     # supporting-file hints) see the expanded content.
     skills_cfg = _load_skills_config()
-    if skills_cfg.get("template_vars", True):
+    if skills_cfg.get("template_vars", True) and not pinned_snapshot_verified:
         content = _substitute_template_vars(content, skill_dir, session_id)
-    if skills_cfg.get("inline_shell", False):
+    if (
+        skills_cfg.get("inline_shell", False)
+        and not pinned_snapshot_verified
+    ):
         timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
         content = _expand_inline_shell(content, skill_dir, timeout)
 
@@ -297,12 +313,19 @@ def _build_skill_message(
     #    bundled scripts without an extra skill_view() round-trip. ──
     if skill_dir:
         parts.append("")
-        parts.append(f"[Skill directory: {skill_dir}]")
-        parts.append(
-            "Resolve any relative paths in this skill (e.g. `scripts/foo.js`, "
-            "`templates/config.yaml`) against that directory, then run them "
-            "with the terminal tool using the absolute path."
-        )
+        if pinned_snapshot_verified:
+            parts.append("[This skill was loaded from a dispatcher-verified snapshot.]")
+            parts.append(
+                "Load supporting files only through skill_view. Do not read or "
+                "execute files directly from the live skill directory."
+            )
+        else:
+            parts.append(f"[Skill directory: {skill_dir}]")
+            parts.append(
+                "Resolve any relative paths in this skill (e.g. `scripts/foo.js`, "
+                "`templates/config.yaml`) against that directory, then run them "
+                "with the terminal tool using the absolute path."
+            )
 
     # ── Inject resolved skill config values ──
     _inject_skill_config(loaded_skill, parts)
@@ -335,7 +358,7 @@ def _build_skill_message(
         if isinstance(entries, list):
             supporting.extend(entries)
 
-    if not supporting and skill_dir:
+    if not supporting and skill_dir and not pinned_snapshot_verified:
         for subdir in ("references", "templates", "scripts", "assets"):
             subdir_path = skill_dir / subdir
             if subdir_path.exists():
@@ -353,12 +376,21 @@ def _build_skill_message(
         parts.append("")
         parts.append("[This skill has supporting files:]")
         for sf in supporting:
-            parts.append(f"- {sf}  ->  {skill_dir / sf}")
-        parts.append(
-            f'\nLoad any of these with skill_view(name="{skill_view_target}", '
-            f'file_path="<path>"), or run scripts directly by absolute path '
-            f"(e.g. `node {skill_dir}/scripts/foo.js`)."
-        )
+            if pinned_snapshot_verified:
+                parts.append(f"- {sf}")
+            else:
+                parts.append(f"- {sf}  ->  {skill_dir / sf}")
+        if pinned_snapshot_verified:
+            parts.append(
+                f'\nLoad these only with skill_view(name="{skill_view_target}", '
+                'file_path="<path>").'
+            )
+        else:
+            parts.append(
+                f'\nLoad any of these with skill_view(name="{skill_view_target}", '
+                f'file_path="<path>"), or run scripts directly by absolute path '
+                f"(e.g. `node {skill_dir}/scripts/foo.js`)."
+            )
 
     if user_instruction:
         parts.append("")
@@ -782,6 +814,18 @@ def build_preloaded_skills_prompt(
             continue
 
         loaded_skill, skill_dir, skill_name = loaded
+
+        from agent.skill_integrity import verify_pinned_skill_tree
+
+        integrity_ok, integrity_error = verify_pinned_skill_tree(
+            skill_name,
+            skill_dir,
+            skills_root=get_hermes_home() / "skills",
+        )
+        if not integrity_ok:
+            logger.error("Refusing pinned skill preload: %s", integrity_error)
+            missing.append(identifier)
+            continue
 
         if skill_name in disabled_names or identifier in disabled_names:
             missing.append(identifier)

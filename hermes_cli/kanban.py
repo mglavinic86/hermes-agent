@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import psutil
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
@@ -1440,12 +1442,15 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
+    scoped = bool(os.environ.get("HERMES_KANBAN_TASK"))
     with kb.connect_closing() as conn:
         ok = kb.heartbeat_worker(
             conn,
             args.task_id,
             note=getattr(args, "note", None),
             expected_run_id=_worker_run_id_for(args.task_id),
+            extend_claim=scoped,
+            claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
         )
     if not ok:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
@@ -2128,15 +2133,40 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    scoped_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not scoped_task_id:
         return None
+    if scoped_task_id != task_id:
+        return 0
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
-        return None
+        return 0
     try:
-        return int(raw)
+        parsed = int(raw)
     except ValueError:
-        return None
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _called_from_active_kanban_worker(conn) -> bool:
+    """Detect worker ancestry independently of removable environment scope."""
+    rows = conn.execute(
+        "SELECT worker_pid FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    active_worker_pids = {
+        int(row["worker_pid"])
+        for row in rows
+        if row["worker_pid"] is not None and int(row["worker_pid"]) > 0
+    }
+    if not active_worker_pids:
+        return False
+    try:
+        process = psutil.Process(os.getpid())
+        process_tree = {process.pid, *(parent.pid for parent in process.parents())}
+    except (psutil.Error, OSError):
+        return True
+    return bool(active_worker_pids & process_tree)
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -2169,6 +2199,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        expected_run_ids: dict[str, Optional[int]] = {}
+        for tid in ids:
+            expected_run_id = _worker_run_id_for(tid)
+            if (
+                expected_run_id is not None
+                and not kb.task_has_active_run(conn, tid, expected_run_id)
+            ):
+                print(
+                    f"cannot complete {tid} (missing, invalid, stale, or "
+                    "foreign worker run identity)",
+                    file=sys.stderr,
+                )
+                return 1
+            expected_run_ids[tid] = expected_run_id
+
         for tid in ids:
             # Goal-mode pre-completion judge gate (mirrors the gate in
             # tools/kanban_tools.py:_handle_complete — Issue #38367).
@@ -2219,7 +2264,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_ids[tid],
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -2264,14 +2309,14 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
+                comment_author=author if reason else None,
+                comment_body=f"BLOCKED: {reason}" if reason else None,
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
@@ -2300,13 +2345,13 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
             if not kb.schedule_task(
                 conn,
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
+                comment_author=author if reason else None,
+                comment_body=f"SCHEDULED: {reason}" if reason else None,
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
@@ -2397,8 +2442,20 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     if not ids and not purge_ids:
         print("at least one task_id is required", file=sys.stderr)
         return 1
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        print(
+            "kanban: dispatcher-scoped workers cannot archive or purge tasks",
+            file=sys.stderr,
+        )
+        return 1
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        if _called_from_active_kanban_worker(conn):
+            print(
+                "kanban: worker process trees cannot archive or purge tasks",
+                file=sys.stderr,
+            )
+            return 1
         if purge_ids:
             for tid in purge_ids:
                 if not kb.delete_archived_task(conn, tid):

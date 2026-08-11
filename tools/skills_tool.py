@@ -84,6 +84,11 @@ from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
 )
+from agent.skill_integrity import (
+    pinned_skill_digests_from_env,
+    read_verified_pinned_skill_snapshot,
+    verify_pinned_skill_tree,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +206,20 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
     if has_traversal_component(candidate):
         return "Skill name cannot contain '..' path traversal components."
     return None
+
+
+def _pinned_skill_integrity_error(
+    name: str,
+    skill_dir: Path | None,
+    skills_root: Path,
+) -> str | None:
+    """Return a fail-closed error for a changed dispatcher-pinned skill."""
+    verified, error = verify_pinned_skill_tree(
+        name,
+        skill_dir,
+        skills_root=skills_root,
+    )
+    return None if verified else (error or "pinned skill digest verification failed")
 
 
 def load_env() -> Dict[str, str]:
@@ -980,6 +999,15 @@ def skill_view(
         JSON string with skill content or error message
     """
     try:
+        pinned_digests = pinned_skill_digests_from_env()
+        if "*" in pinned_digests:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Malformed dispatcher-pinned skill digest map.",
+                },
+                ensure_ascii=False,
+            )
         # Validate before the ':' qualified-name dispatch so a Windows drive
         # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
         # namespace, and so a traversal/absolute name never reaches the
@@ -1036,6 +1064,16 @@ def skill_view(
                         },
                         ensure_ascii=False,
                     )
+                integrity_error = _pinned_skill_integrity_error(
+                    name,
+                    plugin_skill_md.parent,
+                    _skills_dir(),
+                )
+                if integrity_error:
+                    return json.dumps(
+                        {"success": False, "error": integrity_error},
+                        ensure_ascii=False,
+                    )
                 return _serve_plugin_skill(
                     plugin_skill_md,
                     namespace,
@@ -1082,6 +1120,30 @@ def skill_view(
         # Build list of all skill directories to search
         all_dirs = []
         active_skills_dir = _skills_dir()
+        pinned_digests = pinned_skill_digests_from_env()
+        if "*" in pinned_digests:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "malformed dispatcher-pinned skill digest map",
+                },
+                ensure_ascii=False,
+            )
+        durable_reviewer = (
+            name == "immutable-change-reviews"
+            and (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+            and (os.environ.get("HERMES_KANBAN_ROLE") or "").strip().lower()
+            == "reviewer"
+        )
+        if durable_reviewer and name not in pinned_digests:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "missing dispatcher-pinned reviewer skill digest",
+                },
+                ensure_ascii=False,
+            )
+        pinned_name = name if name in pinned_digests else None
         if active_skills_dir.exists():
             all_dirs.append(active_skills_dir)
         all_dirs.extend(get_external_skills_dirs())
@@ -1119,7 +1181,13 @@ def skill_view(
             seen_md.add(key)
             candidates.append((sd, smd))
 
-        for search_dir in all_dirs:
+        if pinned_name is not None:
+            pinned_dir = active_skills_dir / pinned_name
+            pinned_md = pinned_dir / "SKILL.md"
+            if pinned_dir.is_dir() and pinned_md.is_file():
+                _record(pinned_dir, pinned_md)
+
+        for search_dir in ([] if pinned_name is not None else all_dirs):
             # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
             # at the top of the dir).
             direct_path = search_dir / name
@@ -1206,6 +1274,15 @@ def skill_view(
         if candidates:
             skill_dir, skill_md = candidates[0]
 
+        if pinned_name is not None and not skill_md:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"pinned skill digest mismatch for {pinned_name}",
+                },
+                ensure_ascii=False,
+            )
+
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
             return json.dumps(
@@ -1218,9 +1295,25 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Read the file once — reused for platform check and main content below
+        pinned_snapshot, integrity_error = read_verified_pinned_skill_snapshot(
+            name,
+            skill_dir,
+            skills_root=active_skills_dir,
+        )
+        if integrity_error:
+            return json.dumps(
+                {"success": False, "error": integrity_error},
+                ensure_ascii=False,
+            )
+
+        # Pinned skills are consumed exclusively from the exact byte snapshot
+        # whose digest was verified above. Ordinary skills retain the legacy
+        # filesystem read path.
         try:
-            content = skill_md.read_text(encoding="utf-8")
+            if pinned_snapshot is not None:
+                content = pinned_snapshot["SKILL.md"].decode("utf-8")
+            else:
+                content = skill_md.read_text(encoding="utf-8")
         except Exception as e:
             return json.dumps(
                 {
@@ -1317,7 +1410,17 @@ def skill_view(
                     },
                     ensure_ascii=False,
                 )
-            if not target_file.exists():
+            try:
+                snapshot_key = target_file.relative_to(skill_dir).as_posix()
+            except ValueError:
+                snapshot_key = ""
+
+            target_missing = (
+                snapshot_key not in pinned_snapshot
+                if pinned_snapshot is not None
+                else not target_file.exists()
+            )
+            if target_missing:
                 # List available files in the skill directory, organized by type
                 available_files = {
                     "references": [],
@@ -1327,28 +1430,38 @@ def skill_view(
                     "other": [],
                 }
 
-                # Scan for all readable files
-                for f in skill_dir.rglob("*"):
-                    if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
-                        if rel.startswith("references/"):
-                            available_files["references"].append(rel)
-                        elif rel.startswith("templates/"):
-                            available_files["templates"].append(rel)
-                        elif rel.startswith("assets/"):
-                            available_files["assets"].append(rel)
-                        elif rel.startswith("scripts/"):
-                            available_files["scripts"].append(rel)
-                        elif f.suffix in {
-                            ".md",
-                            ".py",
-                            ".yaml",
-                            ".yml",
-                            ".json",
-                            ".tex",
-                            ".sh",
-                        }:
-                            available_files["other"].append(rel)
+                if pinned_snapshot is not None:
+                    available_candidates = [
+                        (rel, PurePosixPath(rel).suffix)
+                        for rel in sorted(pinned_snapshot)
+                        if rel != "SKILL.md"
+                    ]
+                else:
+                    available_candidates = [
+                        (str(f.relative_to(skill_dir)), f.suffix)
+                        for f in skill_dir.rglob("*")
+                        if f.is_file() and f.name != "SKILL.md"
+                    ]
+
+                for rel, suffix in available_candidates:
+                    if rel.startswith("references/"):
+                        available_files["references"].append(rel)
+                    elif rel.startswith("templates/"):
+                        available_files["templates"].append(rel)
+                    elif rel.startswith("assets/"):
+                        available_files["assets"].append(rel)
+                    elif rel.startswith("scripts/"):
+                        available_files["scripts"].append(rel)
+                    elif suffix in {
+                        ".md",
+                        ".py",
+                        ".yaml",
+                        ".yml",
+                        ".json",
+                        ".tex",
+                        ".sh",
+                    }:
+                        available_files["other"].append(rel)
 
                 # Remove empty categories
                 available_files = {k: v for k, v in available_files.items() if v}
@@ -1363,17 +1476,40 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-            # Read the file content
+            # Read pinned content from the verified byte snapshot, never from a
+            # second mutable filesystem read.
+            raw_content: bytes | None = None
             try:
-                content = target_file.read_text(encoding="utf-8")
+                if pinned_snapshot is not None:
+                    raw_content = pinned_snapshot.get(snapshot_key)
+                    if raw_content is None:
+                        raise FileNotFoundError(snapshot_key)
+                    content = raw_content.decode("utf-8")
+                else:
+                    content = target_file.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
+                integrity_error = _pinned_skill_integrity_error(
+                    name,
+                    skill_dir,
+                    active_skills_dir,
+                )
+                if integrity_error:
+                    return json.dumps(
+                        {"success": False, "error": integrity_error},
+                        ensure_ascii=False,
+                    )
+                binary_size = (
+                    len(raw_content)
+                    if raw_content is not None
+                    else target_file.stat().st_size
+                )
                 return json.dumps(
                     {
                         "success": True,
                         "name": name,
                         "file": file_path,
-                        "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
+                        "content": f"[Binary file: {target_file.name}, size: {binary_size} bytes]",
                         "is_binary": True,
                     },
                     ensure_ascii=False,
@@ -1388,6 +1524,17 @@ def skill_view(
                     "Could not record background-review skill read for %s",
                     target_file,
                     exc_info=True,
+                )
+
+            integrity_error = _pinned_skill_integrity_error(
+                name,
+                skill_dir,
+                active_skills_dir,
+            )
+            if integrity_error:
+                return json.dumps(
+                    {"success": False, "error": integrity_error},
+                    ensure_ascii=False,
                 )
 
             return json.dumps(
@@ -1410,7 +1557,32 @@ def skill_view(
         asset_files = []
         script_files = []
 
-        if skill_dir:
+        if pinned_snapshot is not None:
+            for rel in sorted(pinned_snapshot):
+                candidate = PurePosixPath(rel)
+                parts = candidate.parts
+                suffix = candidate.suffix.lower()
+                if len(parts) == 2 and parts[0] == "references" and suffix == ".md":
+                    reference_files.append(rel)
+                elif parts and parts[0] == "templates" and suffix in {
+                    ".md",
+                    ".py",
+                    ".yaml",
+                    ".yml",
+                    ".json",
+                    ".tex",
+                    ".sh",
+                }:
+                    template_files.append(rel)
+                elif parts and parts[0] == "assets":
+                    asset_files.append(rel)
+                elif (
+                    len(parts) == 2
+                    and parts[0] == "scripts"
+                    and suffix in {".py", ".sh", ".bash", ".js", ".ts", ".rb"}
+                ):
+                    script_files.append(rel)
+        elif skill_dir:
             references_dir = skill_dir / "references"
             if references_dir.exists():
                 reference_files = [
@@ -1549,12 +1721,22 @@ def skill_view(
         rendered_content = content
         if preprocess:
             try:
-                from agent.skill_preprocessing import preprocess_skill_content
+                from agent.skill_preprocessing import (
+                    load_skills_config,
+                    preprocess_skill_content,
+                )
+
+                preprocessing_config = None
+                if pinned_snapshot is not None:
+                    preprocessing_config = dict(load_skills_config())
+                    preprocessing_config["template_vars"] = False
+                    preprocessing_config["inline_shell"] = False
 
                 rendered_content = preprocess_skill_content(
                     content,
                     skill_dir,
                     session_id=task_id,
+                    skills_cfg=preprocessing_config,
                 )
             except Exception:
                 logger.debug(
@@ -1568,8 +1750,6 @@ def skill_view(
             "tags": tags,
             "related_skills": related_skills,
             "content": rendered_content,
-            "path": rel_path,
-            "skill_dir": str(skill_dir) if skill_dir else None,
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files
@@ -1585,6 +1765,11 @@ def skill_view(
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
+        if pinned_snapshot is not None:
+            result["_pinned_snapshot_verified"] = True
+        else:
+            result["path"] = rel_path
+            result["skill_dir"] = str(skill_dir) if skill_dir else None
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:
@@ -1625,6 +1810,17 @@ def skill_view(
             result["compatibility"] = frontmatter["compatibility"]
         if isinstance(metadata, dict):
             result["metadata"] = metadata
+
+        integrity_error = _pinned_skill_integrity_error(
+            name,
+            skill_dir,
+            active_skills_dir,
+        )
+        if integrity_error:
+            return json.dumps(
+                {"success": False, "error": integrity_error},
+                ensure_ascii=False,
+            )
 
         return json.dumps(result, ensure_ascii=False)
 
