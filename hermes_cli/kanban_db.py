@@ -3984,6 +3984,12 @@ def _operation_snapshot_matches(
     ):
         if row[column] != snapshot.get(column):
             return False
+    try:
+        from hermes_cli.kanban_goal_operations import validate_terminal_operation_row
+
+        validate_terminal_operation_row(row)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
     return True
 
 
@@ -4083,6 +4089,8 @@ def ack_goal_operation_result(
             or row["state"] != "CLAIMED"
             or row["claim_token"] != claim_token
             or row["request_hash"] != request_hash
+            or row["lease_expires_at"] is None
+            or int(row["lease_expires_at"]) <= current_time
         ):
             return None
         try:
@@ -4173,6 +4181,7 @@ def ack_goal_operation_result(
                    completed_at = ?, updated_at = ?
              WHERE operation_id = ? AND state = 'CLAIMED'
                AND claim_token = ? AND request_hash = ?
+               AND lease_expires_at > ?
             """,
             (
                 state,
@@ -4185,6 +4194,7 @@ def ack_goal_operation_result(
                 operation_id,
                 claim_token,
                 request_hash,
+                current_time,
             ),
         )
         if updated.rowcount != 1:

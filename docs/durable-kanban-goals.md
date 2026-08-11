@@ -93,15 +93,20 @@ or one expired `CLAIMED` lease, using a CAS on operation id, state,
 `TrustedStageRegistry` ID. The generic executor does not run shell commands,
 dynamic imports, arbitrary URLs, `gh`, or model-provided executable payloads.
 Adapter execution happens after the claim transaction commits. Ack re-reads the
-operation, goal, contract, request, claim token, and every authoritative result
-field inside a fresh `BEGIN IMMEDIATE` transaction, so stale claimants and
-foreign/replayed responses cannot write results. `RETRYABLE` keeps the same
-operation identity and uses attempt-based capped exponential backoff.
+operation, goal, contract, request, claim token, unexpired lease, and every
+authoritative result field inside a fresh `BEGIN IMMEDIATE` transaction. The
+final ack UPDATE repeats the token, request-hash, state, and unexpired-lease CAS,
+so stale or expired claimants and foreign/replayed responses cannot write
+results. `RETRYABLE` keeps the same operation identity and uses attempt-based
+capped exponential backoff.
 
 When the supervisor consumes terminal operation evidence, the successor or
-human-gate write transaction revalidates the exact operation request/response
-snapshot. A response changed after validation is not consumed, closing the
-terminal check/use race.
+human-gate write transaction re-reads the exact operation snapshot, recomputes
+the canonical request and response hashes, verifies the evidence digest and
+complete request/response relationship, and checks terminal state against the
+classification. A response changed or re-signed before or after initial
+validation is not consumed, closing both persisted-evidence forgery and
+terminal check/use races.
 
 Malformed, unknown, or request-mismatched adapter results fail closed as a
 canonical `HARD_BLOCK` response. The operation becomes `BLOCKED`, the

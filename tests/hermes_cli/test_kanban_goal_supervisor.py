@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import os
 import subprocess
 from pathlib import Path
@@ -1450,6 +1451,53 @@ def test_terminal_operation_transition_revalidates_exact_operation_snapshot(
 
     assert result.action in {"NOOP", "HUMAN_GATE"}
     assert all(binding.stage != "REVIEW" for binding in bindings)
+
+
+def test_terminal_operation_rejects_hash_valid_response_not_bound_to_request(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        created, _contract = _create_goal_at_waiting_operation(conn)
+        row = conn.execute(
+            "SELECT * FROM kanban_goal_operations WHERE goal_id = ?",
+            (created.goal_id,),
+        ).fetchone()
+        assert row is not None
+        request = _promotion_request_from_operation_row(row)
+        forged = PromotionEvidence.create(
+            adapter_id="fixture-adapter",
+            request=replace(request, remote_tree="9" * 40),
+            classification=ResultClassification.PASS,
+            summary="hash-valid but not request-bound",
+        )
+        response_text = json.dumps(
+            forged.as_payload(), sort_keys=True, separators=(",", ":")
+        )
+        import hashlib
+
+        response_hash = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+        conn.execute(
+            """
+            UPDATE kanban_goal_operations
+               SET state = 'SUCCEEDED', response_hash = ?, response_payload = ?,
+                   completed_at = 10, updated_at = 10
+             WHERE operation_id = ?
+            """,
+            (response_hash, response_text, row["operation_id"]),
+        )
+
+        result = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        bindings = list_durable_goal_tasks(conn, created.goal_id)
+        goal = get_durable_goal(conn, created.goal_id)
+
+    assert result.action in {"NOOP", "HUMAN_GATE"}
+    assert all(binding.stage != "REVIEW" for binding in bindings)
+    assert goal is not None and goal.current_stage == "VERIFY_PROMOTE"
 
 
 def test_malformed_verify_payload_blocks_without_successor_and_notifies_once(

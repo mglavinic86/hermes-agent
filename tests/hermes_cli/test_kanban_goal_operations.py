@@ -345,6 +345,40 @@ def test_claim_is_atomic_and_stale_claim_cannot_ack(tmp_path, monkeypatch):
     assert row.claim_token == "second"
 
 
+def test_expired_claim_cannot_ack_before_takeover(tmp_path, monkeypatch):
+    _setup_home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        _create_waiting_operation(conn)
+        claimed = claim_due_operation(
+            conn,
+            now=100,
+            lease_seconds=30,
+            claim_token="expired",
+        )
+        assert claimed is not None
+        request = _request_from_claimed(claimed, conn)
+        evidence = PromotionEvidence.create(
+            adapter_id="fixture-adapter",
+            request=request,
+            classification=ResultClassification.PASS,
+            summary="late ack must not win",
+        )
+        acked = kb.ack_goal_operation_result(
+            conn,
+            operation_id=claimed.operation_id,
+            claim_token="expired",
+            request_hash=claimed.request_hash,
+            response_payload=evidence.as_payload(),
+            now=131,
+        )
+        row = get_operation(conn, claimed.operation_id)
+
+    assert acked is None
+    assert row is not None
+    assert row.state == OperationState.CLAIMED
+    assert row.claim_token == "expired"
+
+
 def test_two_connection_claim_takeover_and_stale_ack_are_race_safe(
     tmp_path, monkeypatch
 ):

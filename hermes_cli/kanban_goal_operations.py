@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import time
@@ -221,6 +222,41 @@ def _validate_response_payload(
     return evidence.as_payload()
 
 
+def validate_terminal_operation_row(row) -> PromotionEvidence:
+    """Revalidate a persisted terminal response against its canonical request."""
+    operation = _operation_from_row(row)
+    if operation.state not in {OperationState.SUCCEEDED, OperationState.BLOCKED}:
+        raise ValueError("operation is not terminal")
+    request_text = json.dumps(
+        operation.request_payload, sort_keys=True, separators=(",", ":")
+    )
+    if hashlib.sha256(request_text.encode("utf-8")).hexdigest() != operation.request_hash:
+        raise ValueError("operation request hash does not match persisted request")
+    if operation.response_payload is None or not operation.response_hash:
+        raise ValueError("terminal operation response is missing")
+    response_text = json.dumps(
+        operation.response_payload, sort_keys=True, separators=(",", ":")
+    )
+    if hashlib.sha256(response_text.encode("utf-8")).hexdigest() != operation.response_hash:
+        raise ValueError("operation response hash does not match persisted response")
+    canonical_payload = _validate_response_payload(
+        operation,
+        operation.response_payload,
+    )
+    evidence = PromotionEvidence.from_payload(canonical_payload)
+    if operation.state == OperationState.SUCCEEDED and evidence.classification not in {
+        ResultClassification.PASS,
+        ResultClassification.REPAIRABLE_FAILURE,
+    }:
+        raise ValueError("succeeded operation has non-terminal-success classification")
+    if (
+        operation.state == OperationState.BLOCKED
+        and evidence.classification != ResultClassification.HARD_BLOCK
+    ):
+        raise ValueError("blocked operation has non-blocking classification")
+    return evidence
+
+
 def execute_due_operation_once(
     conn,
     *,
@@ -263,4 +299,5 @@ __all__ = [
     "claim_due_operation",
     "execute_due_operation_once",
     "get_operation",
+    "validate_terminal_operation_row",
 ]
