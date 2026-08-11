@@ -406,6 +406,7 @@ def apply_trusted_stage_result(
     conn,
     goal_id: str,
     evidence: PromotionEvidence,
+    operation_snapshot: Mapping[str, Any] | None = None,
 ) -> SupervisionResult:
     """Apply precomputed deterministic evidence; never execute an adapter."""
     goal = get_durable_goal(conn, goal_id)
@@ -449,6 +450,7 @@ def apply_trusted_stage_result(
             candidate_sha=evidence.candidate_sha,
             task_status="review",
             skills=("immutable-change-reviews",),
+            expected_operation_snapshot=operation_snapshot,
         )
         if successor is None:
             return SupervisionResult("NOOP", goal.id, reason="transition_lost")
@@ -465,6 +467,7 @@ def apply_trusted_stage_result(
             assignee=str(goal.orchestrator_profile or ""),
             evidence=evidence.as_payload(),
             candidate_sha=evidence.candidate_sha,
+            expected_operation_snapshot=operation_snapshot,
         )
         if successor is None:
             return SupervisionResult("NOOP", goal.id, reason="transition_lost")
@@ -487,12 +490,54 @@ def apply_trusted_stage_result(
                 "reason": evidence.summary,
             },
             blocked_reason=evidence.summary,
+            expected_operation_snapshot=operation_snapshot,
         )
         if not transitioned:
             return SupervisionResult("NOOP", goal.id, reason="transition_lost")
         return SupervisionResult("HUMAN_GATE", goal.id, reason=evidence.summary)
     return SupervisionResult(
         evidence.classification.value, goal.id, reason=evidence.summary
+    )
+
+
+def _apply_terminal_goal_operation(conn, goal: DurableGoal) -> SupervisionResult:
+    if goal.current_stage != "VERIFY_PROMOTE":
+        return SupervisionResult("NOOP", goal.id, reason="not_waiting_operation")
+    row = conn.execute(
+        """
+        SELECT * FROM kanban_goal_operations
+         WHERE goal_id = ? AND kind = 'VERIFY_PROMOTE'
+           AND state IN ('SUCCEEDED', 'BLOCKED')
+         ORDER BY stage_attempt DESC, updated_at DESC
+         LIMIT 1
+        """,
+        (goal.id,),
+    ).fetchone()
+    if row is None or not row["response_payload"]:
+        return SupervisionResult("NOOP", goal.id, reason="no_terminal_operation")
+    try:
+        payload = json.loads(str(row["response_payload"]))
+        evidence = PromotionEvidence.from_payload(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return SupervisionResult("NOOP", goal.id, reason="invalid_operation_response")
+    if evidence.operation_id != row["operation_id"] or evidence.request_hash != row["request_hash"]:
+        return SupervisionResult("NOOP", goal.id, reason="operation_response_mismatch")
+    operation_snapshot = {
+        "operation_id": row["operation_id"],
+        "goal_id": row["goal_id"],
+        "kind": row["kind"],
+        "stage_attempt": row["stage_attempt"],
+        "state": row["state"],
+        "request_hash": row["request_hash"],
+        "request_payload": row["request_payload"],
+        "response_hash": row["response_hash"],
+        "response_payload": row["response_payload"],
+    }
+    return apply_trusted_stage_result(
+        conn,
+        goal.id,
+        evidence,
+        operation_snapshot=operation_snapshot,
     )
 
 
@@ -1046,6 +1091,39 @@ def _payload_has_blocking_findings(payload: Mapping[str, Any]) -> bool:
     return False
 
 
+def _build_payload_has_exact_operation_fields(
+    payload: Mapping[str, Any], goal: DurableGoal
+) -> bool:
+    required_string_fields = (
+        "candidate_sha",
+        "candidate_tree",
+        "branch_identity",
+        "pr_identity",
+        "remote_base",
+        "remote_head",
+        "remote_tree",
+    )
+    for key in required_string_fields:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    candidate_sha = str(payload["candidate_sha"]).strip().lower()
+    candidate_tree = str(payload["candidate_tree"]).strip().lower()
+    remote_base = str(payload["remote_base"]).strip().lower()
+    remote_head = str(payload["remote_head"]).strip().lower()
+    remote_tree = str(payload["remote_tree"]).strip().lower()
+    contract = goal.task_contract
+    return bool(
+        contract is not None
+        and _CANDIDATE_SHA_RE.fullmatch(candidate_sha)
+        and _CANDIDATE_SHA_RE.fullmatch(candidate_tree)
+        and remote_base == contract.base_revision.lower()
+        and remote_head == candidate_sha
+        and remote_tree == candidate_tree
+        and isinstance(payload.get("deterministic_gate_evidence"), Mapping)
+    )
+
+
 def _supervise_v2_goal_once(
     conn,
     goal: DurableGoal,
@@ -1352,7 +1430,11 @@ def _supervise_v2_goal_once(
             expected_profile=goal.builder_profile,
         )
         candidate_sha = str((payload or {}).get("candidate_sha") or "").strip().lower()
-        if payload is None or not _CANDIDATE_SHA_RE.fullmatch(candidate_sha):
+        if (
+            payload is None
+            or not _CANDIDATE_SHA_RE.fullmatch(candidate_sha)
+            or not _build_payload_has_exact_operation_fields(payload, goal)
+        ):
             return _block_v2_goal_from_current_event(
                 conn,
                 goal,
@@ -1434,6 +1516,10 @@ def supervise_goal_once(
         return SupervisionResult("NOOP", goal_id, reason="schema_mismatch")
     if int(runtime_protocol_version) != goal.protocol_version:
         return SupervisionResult("NOOP", goal_id, reason="protocol_mismatch")
+    if goal.current_stage == "VERIFY_PROMOTE":
+        operation_result = _apply_terminal_goal_operation(conn, goal)
+        if operation_result.action != "NOOP":
+            return operation_result
     binding = _current_binding(conn, goal)
     if binding is None or binding.completion_event_id is not None:
         return SupervisionResult("NOOP", goal_id, reason="no_current_binding")

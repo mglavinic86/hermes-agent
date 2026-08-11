@@ -75,6 +75,19 @@ def _complete_bound_task(
         else kb.claim_task(conn, task_id, claimer=profile)
     )
     assert task is not None and task.current_run_id is not None
+    durable_fields = dict(fields)
+    if stage == "BUILD_CANDIDATE" or stage.startswith("REPAIR_BUILD_"):
+        candidate_sha = str(durable_fields.get("candidate_sha") or "").strip().lower()
+        if candidate_sha:
+            durable_fields.setdefault("candidate_tree", candidate_sha)
+            durable_fields.setdefault("branch_identity", f"turpi/{candidate_sha[:12]}")
+            durable_fields.setdefault("pr_identity", f"pr-{candidate_sha[:12]}")
+            durable_fields.setdefault("remote_base", contract.base_revision)
+            durable_fields.setdefault("remote_head", candidate_sha)
+            durable_fields.setdefault("remote_tree", durable_fields["candidate_tree"])
+            durable_fields.setdefault(
+                "deterministic_gate_evidence", {"focused-tests": "passed"}
+            )
     payload = {
         "workflow_version": 2,
         "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
@@ -85,7 +98,7 @@ def _complete_bound_task(
         "scope": list(contract.scope),
         "gates": list(contract.gates),
         "authority": profile,
-        **fields,
+        **durable_fields,
     }
     assert kb.complete_task(
         conn,

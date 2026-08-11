@@ -69,6 +69,45 @@ there are no `BLOCKER` or `MAJOR` findings, and no human gate is requested.
 builder. `HUMAN_GATE` terminalizes safely and enqueues one logical owner
 notification.
 
+## Durable Verify/Promote Operations
+
+`VERIFY_PROMOTE` is a durable taskless operation, not an LLM authority. When
+`BUILD_CANDIDATE` or `REPAIR_BUILD_n` completes, the same SQLite
+`BEGIN IMMEDIATE` transition that moves the goal into `VERIFY_PROMOTE` also
+creates or reuses exactly one `kanban_goal_operations` row for
+`(goal_id, "VERIFY_PROMOTE", stage_attempt)`. The `operation_id` is stable for
+that tuple, and the operation stores a canonical request payload plus
+`request_hash`.
+
+The request hash binds the static adapter id, task contract hash/version,
+expected base revision, candidate SHA/tree, branch identity, PR identity,
+remote base/head/tree, and deterministic gate evidence. Builder evidence must
+provide every field canonically: remote base equals the contract base SHA,
+remote head equals the candidate SHA, and remote tree equals the candidate
+tree. Missing or foreign readback fields fail closed before an operation row is
+created; no identity or tree is fabricated.
+
+Gateway board ticks claim at most one due `PENDING` or `RETRYABLE` operation,
+or one expired `CLAIMED` lease, using a CAS on operation id, state,
+`request_hash`, and lease. Adapter lookup is only by static
+`TrustedStageRegistry` ID. The generic executor does not run shell commands,
+dynamic imports, arbitrary URLs, `gh`, or model-provided executable payloads.
+Adapter execution happens after the claim transaction commits. Ack re-reads the
+operation, goal, contract, request, claim token, and every authoritative result
+field inside a fresh `BEGIN IMMEDIATE` transaction, so stale claimants and
+foreign/replayed responses cannot write results. `RETRYABLE` keeps the same
+operation identity and uses attempt-based capped exponential backoff.
+
+When the supervisor consumes terminal operation evidence, the successor or
+human-gate write transaction revalidates the exact operation request/response
+snapshot. A response changed after validation is not consumed, closing the
+terminal check/use race.
+
+Malformed, unknown, or request-mismatched adapter results fail closed as a
+canonical `HARD_BLOCK` response. The operation becomes `BLOCKED`, the
+supervisor terminalizes the goal to a human gate, and the owner outbox uses its
+logical dedupe key so replay does not create duplicate notifications.
+
 ## Rollout And Migration
 
 Every gateway instance that can acquire the machine-wide Kanban dispatcher lock

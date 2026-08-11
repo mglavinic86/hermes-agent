@@ -1489,6 +1489,29 @@ CREATE TABLE IF NOT EXISTS kanban_goal_notification_outbox (
     FOREIGN KEY (goal_id) REFERENCES kanban_goals(id)
 );
 
+CREATE TABLE IF NOT EXISTS kanban_goal_operations (
+    operation_id      TEXT PRIMARY KEY,
+    goal_id           TEXT NOT NULL,
+    kind              TEXT NOT NULL,
+    stage_attempt     INTEGER NOT NULL,
+    request_hash      TEXT NOT NULL,
+    request_payload   TEXT NOT NULL,
+    state             TEXT NOT NULL,
+    claim_token       TEXT,
+    claimed_at        INTEGER,
+    lease_expires_at  INTEGER,
+    attempt_count     INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at   INTEGER,
+    response_hash     TEXT,
+    response_payload  TEXT,
+    last_error        TEXT,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    completed_at      INTEGER,
+    UNIQUE(goal_id, kind, stage_attempt),
+    FOREIGN KEY (goal_id) REFERENCES kanban_goals(id)
+);
+
 -- Compatibility heartbeat owned by the machine-wide singleton dispatcher.
 -- No profile identity participates: a creator only trusts an exact, fresh
 -- schema/protocol lease written by the runtime that holds dispatch authority.
@@ -1515,6 +1538,10 @@ CREATE INDEX IF NOT EXISTS idx_goal_status           ON kanban_goals(status, upd
 CREATE INDEX IF NOT EXISTS idx_goal_tasks_goal       ON kanban_goal_tasks(goal_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_goal_outbox_pending
     ON kanban_goal_notification_outbox(delivered_at, id);
+CREATE INDEX IF NOT EXISTS idx_goal_operations_due
+    ON kanban_goal_operations(state, next_attempt_at, lease_expires_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_goal_operations_goal
+    ON kanban_goal_operations(goal_id, kind, stage_attempt);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_origin_message
     ON kanban_goals(origin_platform, origin_chat_id, origin_message_id)
     WHERE origin_message_id IS NOT NULL AND origin_message_id != '';
@@ -3822,6 +3849,87 @@ def transition_durable_goal_to_waiting_stage(
         )
         if binding_update.rowcount != 1:
             raise RuntimeError("durable waiting-stage predecessor CAS failed")
+        if waiting_stage == "VERIFY_PROMOTE":
+            stage_attempt = int(
+                conn.execute(
+                    "SELECT attempt FROM kanban_goal_tasks "
+                    "WHERE goal_id = ? AND task_id = ?",
+                    (goal_id, predecessor_task_id),
+                ).fetchone()["attempt"]
+            )
+            operation_candidate_sha = str(
+                completion_payload.get("candidate_sha") or candidate_sha or ""
+            ).strip().lower()
+            candidate_tree = str(completion_payload.get("candidate_tree") or "").strip().lower()
+            branch_identity = str(completion_payload.get("branch_identity") or "").strip()
+            pr_identity = str(completion_payload.get("pr_identity") or "").strip()
+            remote_base = str(completion_payload.get("remote_base") or "").strip()
+            remote_head = str(completion_payload.get("remote_head") or "").strip()
+            remote_tree = str(completion_payload.get("remote_tree") or "").strip().lower()
+            task_contract = _json_snapshot_value(goal["task_contract_json"])
+            expected_base = str(
+                (task_contract or {}).get("base_revision")
+                if isinstance(task_contract, Mapping)
+                else ""
+            ).strip()
+            request_payload = {
+                "operation_id": stable_goal_operation_id(
+                    goal_id=goal_id,
+                    kind="VERIFY_PROMOTE",
+                    stage_attempt=stage_attempt,
+                ),
+                "goal_id": goal_id,
+                "kind": "VERIFY_PROMOTE",
+                "stage_attempt": stage_attempt,
+                "adapter_id": str(goal["verify_promote_adapter_id"] or ""),
+                "contract_hash": str(goal["task_contract_hash"] or ""),
+                "contract_version": int(goal["workflow_version"]),
+                "task_contract": task_contract,
+                "expected_base_sha": expected_base,
+                "base_revision": expected_base,
+                "scope": list(completion_payload.get("scope") or []),
+                "gates": list(completion_payload.get("gates") or []),
+                "candidate_sha": operation_candidate_sha,
+                "candidate_tree": candidate_tree,
+                "branch_identity": branch_identity,
+                "pr_identity": pr_identity,
+                "remote_base": remote_base,
+                "remote_head": remote_head,
+                "remote_tree": remote_tree,
+                "deterministic_gate_evidence": dict(
+                    completion_payload.get("deterministic_gate_evidence") or {}
+                ),
+            }
+            request_text = _canonical_json_text(request_payload)
+            request_hash = hashlib.sha256(request_text.encode("utf-8")).hexdigest()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO kanban_goal_operations (
+                    operation_id, goal_id, kind, stage_attempt, request_hash,
+                    request_payload, state, next_attempt_at, created_at, updated_at
+                ) VALUES (?, ?, 'VERIFY_PROMOTE', ?, ?, ?, 'PENDING', ?, ?, ?)
+                """,
+                (
+                    request_payload["operation_id"],
+                    goal_id,
+                    stage_attempt,
+                    request_hash,
+                    request_text,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            operation = conn.execute(
+                "SELECT * FROM kanban_goal_operations WHERE operation_id = ?",
+                (request_payload["operation_id"],),
+            ).fetchone()
+            if (
+                operation is None
+                or operation["request_hash"] != request_hash
+                or operation["request_payload"] != request_text
+            ):
+                raise RuntimeError("durable verify/promote operation collision")
         goal_update = conn.execute(
             "UPDATE kanban_goals SET current_stage = ?, "
             "candidate_sha = COALESCE(?, candidate_sha), "
@@ -3832,6 +3940,259 @@ def transition_durable_goal_to_waiting_stage(
         if goal_update.rowcount != 1:
             raise RuntimeError("durable waiting-stage state CAS failed")
     return True
+
+
+_GOAL_OPERATION_STATES = frozenset(
+    {"PENDING", "CLAIMED", "RETRYABLE", "SUCCEEDED", "BLOCKED"}
+)
+
+
+def _canonical_json_text(payload: Mapping[str, Any]) -> str:
+    return json.dumps(dict(payload), sort_keys=True, separators=(",", ":"))
+
+
+def _hash_canonical_payload(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json_text(payload).encode("utf-8")).hexdigest()
+
+
+def _operation_snapshot_matches(
+    conn: sqlite3.Connection,
+    snapshot: Optional[Mapping[str, Any]],
+) -> bool:
+    if snapshot is None:
+        return True
+    try:
+        operation_id = str(snapshot["operation_id"])
+        row = conn.execute(
+            "SELECT * FROM kanban_goal_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+    except (KeyError, TypeError, sqlite3.Error):
+        return False
+    if row is None:
+        return False
+    for column in (
+        "operation_id",
+        "goal_id",
+        "kind",
+        "stage_attempt",
+        "state",
+        "request_hash",
+        "request_payload",
+        "response_hash",
+        "response_payload",
+    ):
+        if row[column] != snapshot.get(column):
+            return False
+    return True
+
+
+def stable_goal_operation_id(*, goal_id: str, kind: str, stage_attempt: int) -> str:
+    payload = {
+        "goal_id": str(goal_id),
+        "kind": str(kind),
+        "stage_attempt": int(stage_attempt),
+    }
+    return "goalop_" + _hash_canonical_payload(payload)[:48]
+
+
+def create_or_reuse_goal_operation(
+    conn: sqlite3.Connection,
+    *,
+    goal_id: str,
+    kind: str,
+    stage_attempt: int,
+    request_payload: Mapping[str, Any],
+    now: Optional[int] = None,
+) -> sqlite3.Row:
+    kind = str(kind or "").strip()
+    attempt = int(stage_attempt)
+    if not kind or attempt < 0:
+        raise ValueError("invalid durable goal operation identity")
+    canonical_request = _canonical_json_text(request_payload)
+    request_hash = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+    operation_id = stable_goal_operation_id(
+        goal_id=goal_id, kind=kind, stage_attempt=attempt
+    )
+    current_time = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_goal_operations (
+                operation_id, goal_id, kind, stage_attempt, request_hash,
+                request_payload, state, next_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+            """,
+            (
+                operation_id,
+                goal_id,
+                kind,
+                attempt,
+                request_hash,
+                canonical_request,
+                current_time,
+                current_time,
+                current_time,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM kanban_goal_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("durable goal operation insert failed")
+        if (
+            row["goal_id"] != goal_id
+            or row["kind"] != kind
+            or int(row["stage_attempt"]) != attempt
+            or row["request_hash"] != request_hash
+            or row["request_payload"] != canonical_request
+        ):
+            raise RuntimeError("durable goal operation identity collision")
+        return row
+
+
+def ack_goal_operation_result(
+    conn: sqlite3.Connection,
+    *,
+    operation_id: str,
+    claim_token: str,
+    request_hash: str,
+    response_payload: Mapping[str, Any],
+    now: Optional[int] = None,
+) -> Optional[sqlite3.Row]:
+    current_time = int(time.time()) if now is None else int(now)
+    response_text = _canonical_json_text(response_payload)
+    response_hash = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+    try:
+        from hermes_cli.kanban_trusted_stages import (
+            PromotionEvidence,
+            ResultClassification,
+        )
+
+        evidence = PromotionEvidence.from_payload(response_payload)
+    except Exception:
+        return None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM kanban_goal_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] != "CLAIMED"
+            or row["claim_token"] != claim_token
+            or row["request_hash"] != request_hash
+        ):
+            return None
+        try:
+            request_payload = json.loads(str(row["request_payload"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(request_payload, dict):
+            return None
+        goal = conn.execute(
+            "SELECT * FROM kanban_goals WHERE id = ?", (row["goal_id"],)
+        ).fetchone()
+        try:
+            contract_payload = _json_snapshot_value(goal["task_contract_json"]) if goal else None
+            expected_attempt = int(request_payload.get("stage_attempt"))
+            expected_contract_version = int(request_payload.get("contract_version"))
+        except (TypeError, ValueError):
+            return None
+        if (
+            goal is None
+            or goal["status"] != "ACTIVE"
+            or goal["current_stage"] != "VERIFY_PROMOTE"
+            or int(goal["workflow_version"]) != expected_contract_version
+            or str(goal["task_contract_hash"] or "")
+            != str(request_payload.get("contract_hash") or "")
+            or not isinstance(contract_payload, Mapping)
+            or str(contract_payload.get("contract_hash") or "")
+            != str(request_payload.get("contract_hash") or "")
+            or str(contract_payload.get("base_revision") or "")
+            != str(request_payload.get("base_revision") or "")
+            or str(goal["candidate_sha"] or "").strip().lower()
+            != str(request_payload.get("candidate_sha") or "").strip().lower()
+            or _hash_canonical_payload(request_payload) != row["request_hash"]
+        ):
+            return None
+        expected_gate_evidence = dict(
+            request_payload.get("deterministic_gate_evidence") or {}
+        )
+        if (
+            evidence.operation_id != row["operation_id"]
+            or evidence.request_hash != row["request_hash"]
+            or evidence.adapter_id != str(goal["verify_promote_adapter_id"] or "")
+            or evidence.contract_hash != request_payload.get("contract_hash")
+            or evidence.contract_version != expected_contract_version
+            or evidence.base_revision != request_payload.get("base_revision")
+            or evidence.scope != tuple(str(item) for item in request_payload.get("scope") or ())
+            or evidence.gates != tuple(str(item) for item in request_payload.get("gates") or ())
+            or evidence.attempt != expected_attempt
+            or str(evidence.candidate_sha).strip().lower()
+            != str(request_payload.get("candidate_sha") or "").strip().lower()
+            or str(evidence.candidate_tree or "").strip().lower()
+            != str(request_payload.get("candidate_tree") or "").strip().lower()
+            or evidence.branch_identity != request_payload.get("branch_identity")
+            or evidence.pr_identity != request_payload.get("pr_identity")
+            or evidence.remote_base != request_payload.get("remote_base")
+            or evidence.remote_head != request_payload.get("remote_head")
+            or str(evidence.remote_tree or "").strip().lower()
+            != str(request_payload.get("remote_tree") or "").strip().lower()
+            or dict(evidence.gate_evidence or {}) != expected_gate_evidence
+        ):
+            return None
+        if evidence.classification == ResultClassification.PASS:
+            state = "SUCCEEDED"
+            completed_at = current_time
+            next_attempt_at = None
+            last_error = None
+        elif evidence.classification == ResultClassification.RETRYABLE:
+            state = "RETRYABLE"
+            completed_at = None
+            delay = min(3600, 30 * (2 ** max(0, int(row["attempt_count"]))))
+            next_attempt_at = current_time + delay
+            last_error = str(evidence.summary or "retryable")
+        elif evidence.classification == ResultClassification.REPAIRABLE_FAILURE:
+            state = "SUCCEEDED"
+            completed_at = current_time
+            next_attempt_at = None
+            last_error = None
+        else:
+            state = "BLOCKED"
+            completed_at = current_time
+            next_attempt_at = None
+            last_error = str(evidence.summary or "hard block")
+        updated = conn.execute(
+            """
+            UPDATE kanban_goal_operations
+               SET state = ?, claim_token = NULL, claimed_at = NULL,
+                   lease_expires_at = NULL, response_hash = ?,
+                   response_payload = ?, last_error = ?, next_attempt_at = ?,
+                   completed_at = ?, updated_at = ?
+             WHERE operation_id = ? AND state = 'CLAIMED'
+               AND claim_token = ? AND request_hash = ?
+            """,
+            (
+                state,
+                response_hash,
+                response_text,
+                last_error,
+                next_attempt_at,
+                completed_at,
+                current_time,
+                operation_id,
+                claim_token,
+                request_hash,
+            ),
+        )
+        if updated.rowcount != 1:
+            return None
+        return conn.execute(
+            "SELECT * FROM kanban_goal_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
 
 
 def transition_durable_goal_from_waiting_to_successor(
@@ -3849,6 +4210,7 @@ def transition_durable_goal_from_waiting_to_successor(
     task_status: str = "ready",
     reserve_budget: Optional[str] = None,
     skills: Optional[Iterable[str]] = None,
+    expected_operation_snapshot: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
     """Create an LLM successor from an injected deterministic result.
 
@@ -3890,6 +4252,7 @@ def transition_durable_goal_from_waiting_to_successor(
             or goal["current_stage"] != waiting_stage
             or int(goal["state_version"]) != state_version
             or str(goal["candidate_sha"] or "") != candidate_sha
+            or not _operation_snapshot_matches(conn, expected_operation_snapshot)
         ):
             return None
         source_binding = conn.execute(
@@ -3994,6 +4357,7 @@ def transition_durable_goal_waiting_to_terminal(
     notification_kind: str,
     notification_payload: Mapping[str, Any],
     blocked_reason: str,
+    expected_operation_snapshot: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Terminalize a taskless deterministic boundary and notify exactly once."""
     try:
@@ -4022,6 +4386,7 @@ def transition_durable_goal_waiting_to_terminal(
             or goal["status"] != "ACTIVE"
             or goal["current_stage"] != waiting_stage
             or int(goal["state_version"]) != state_version
+            or not _operation_snapshot_matches(conn, expected_operation_snapshot)
         ):
             return False
         updated = conn.execute(

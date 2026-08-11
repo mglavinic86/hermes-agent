@@ -34,6 +34,28 @@ from hermes_cli.kanban_trusted_stages import (
 )
 
 
+def _promotion_request_from_operation_row(row) -> PromotionRequest:
+    payload = json.loads(row["request_payload"])
+    return PromotionRequest(
+        contract_hash=payload["contract_hash"],
+        base_revision=payload["base_revision"],
+        scope=tuple(payload["scope"]),
+        gates=tuple(payload["gates"]),
+        candidate_sha=payload["candidate_sha"],
+        attempt=payload["stage_attempt"],
+        operation_id=row["operation_id"],
+        request_hash=row["request_hash"],
+        contract_version=payload["contract_version"],
+        candidate_tree=payload["candidate_tree"],
+        branch_identity=payload["branch_identity"],
+        pr_identity=payload["pr_identity"],
+        remote_base=payload["remote_base"],
+        remote_head=payload["remote_head"],
+        remote_tree=payload["remote_tree"],
+        gate_evidence=payload["deterministic_gate_evidence"],
+    )
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -80,6 +102,19 @@ def _complete_v2_task(
     stage: str,
     fields: dict[str, object],
 ):
+    durable_fields = dict(fields)
+    if stage == "BUILD_CANDIDATE" or stage.startswith("REPAIR_BUILD_"):
+        candidate_sha = str(durable_fields.get("candidate_sha") or "").strip().lower()
+        if candidate_sha:
+            durable_fields.setdefault("candidate_tree", candidate_sha)
+            durable_fields.setdefault("branch_identity", f"turpi/{candidate_sha[:12]}")
+            durable_fields.setdefault("pr_identity", f"pr-{candidate_sha[:12]}")
+            durable_fields.setdefault("remote_base", contract.base_revision)
+            durable_fields.setdefault("remote_head", candidate_sha)
+            durable_fields.setdefault("remote_tree", durable_fields["candidate_tree"])
+            durable_fields.setdefault(
+                "deterministic_gate_evidence", {"focused-tests": "passed"}
+            )
     task = (
         kb.claim_review_task(conn, task_id, claimer=profile, allow_durable=True)
         if stage == "REVIEW"
@@ -101,7 +136,7 @@ def _complete_v2_task(
                 "scope": list(contract.scope),
                 "gates": list(contract.gates),
                 "authority": profile,
-                **fields,
+                **durable_fields,
             }
         },
         expected_run_id=task.current_run_id,
@@ -277,6 +312,42 @@ def _create_goal_at_review(
     review_id = apply_trusted_stage_result(conn, created.goal_id, evidence).task_id
     assert review_id is not None
     return created, review_id
+
+
+def _create_goal_at_waiting_operation(
+    conn,
+    *,
+    candidate_sha: str = "b" * 40,
+):
+    created, build_id, contract = _create_v2_goal_at_build(
+        conn,
+        candidate_key=candidate_sha,
+    )
+    _complete_v2_task(
+        conn,
+        task_id=build_id,
+        profile="builder",
+        contract=contract,
+        stage="BUILD_CANDIDATE",
+        fields={
+            "candidate_sha": candidate_sha,
+            "candidate_tree": "c" * 40,
+            "branch_identity": "turpi/supervisor-race",
+            "pr_identity": "pr-supervisor-race",
+            "remote_base": contract.base_revision,
+            "remote_head": candidate_sha,
+            "remote_tree": "c" * 40,
+            "deterministic_gate_evidence": {"focused-tests": "passed"},
+        },
+    )
+    waiting = supervise_goal_once(
+        conn,
+        created.goal_id,
+        board="default",
+        runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+    )
+    assert waiting.action == "AWAITING_TRUSTED_RESULT"
+    return created, contract
 
 
 def _create_goal_at_repair(conn, *, candidate_sha: str):
@@ -917,6 +988,13 @@ def test_structured_build_completion_binds_current_run_and_creates_verify(
         "gates": list(contract.gates),
         "authority": "builder",
         "candidate_sha": candidate_sha,
+        "candidate_tree": candidate_sha,
+        "branch_identity": f"turpi/{candidate_sha[:12]}",
+        "pr_identity": f"pr-{candidate_sha[:12]}",
+        "remote_base": contract.base_revision,
+        "remote_head": candidate_sha,
+        "remote_tree": candidate_sha,
+        "deterministic_gate_evidence": {"focused-tests": "passed"},
     }
 
 
@@ -1300,6 +1378,78 @@ def test_repair_for_different_input_candidate_sha_fails_closed(kanban_home):
     ]
     assert notifications[0].payload["candidate_sha"] == old_sha
     assert notifications[0].payload["reason"] == "repair_input_candidate_mismatch"
+
+
+def test_terminal_operation_transition_revalidates_exact_operation_snapshot(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        created, _contract = _create_goal_at_waiting_operation(conn)
+        row = conn.execute(
+            "SELECT * FROM kanban_goal_operations WHERE goal_id = ?",
+            (created.goal_id,),
+        ).fetchone()
+        assert row is not None
+        request = _promotion_request_from_operation_row(row)
+        evidence = PromotionEvidence.create(
+            adapter_id="fixture-adapter",
+            request=request,
+            classification=ResultClassification.PASS,
+            summary="validated before mutation",
+        )
+        response_payload = evidence.as_payload()
+        response_text = json.dumps(
+            response_payload, sort_keys=True, separators=(",", ":")
+        )
+        import hashlib
+
+        response_hash = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+        conn.execute(
+            """
+            UPDATE kanban_goal_operations
+               SET state = 'SUCCEEDED', response_hash = ?, response_payload = ?,
+                   completed_at = 10, updated_at = 10
+             WHERE operation_id = ?
+            """,
+            (response_hash, response_text, row["operation_id"]),
+        )
+
+        original = kb.transition_durable_goal_from_waiting_to_successor
+
+        def mutate_then_transition(*args, **kwargs):
+            conn.execute(
+                """
+                UPDATE kanban_goal_operations
+                   SET response_payload = ?, response_hash = ?
+                 WHERE operation_id = ?
+                """,
+                (
+                    json.dumps(
+                        {**response_payload, "summary": "mutated after validation"},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "0" * 64,
+                    row["operation_id"],
+                ),
+            )
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            kb,
+            "transition_durable_goal_from_waiting_to_successor",
+            mutate_then_transition,
+        )
+        result = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        bindings = list_durable_goal_tasks(conn, created.goal_id)
+
+    assert result.action in {"NOOP", "HUMAN_GATE"}
+    assert all(binding.stage != "REVIEW" for binding in bindings)
 
 
 def test_malformed_verify_payload_blocks_without_successor_and_notifies_once(

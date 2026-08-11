@@ -33,6 +33,9 @@ def _prepare_durable_goal_board_tick(
     board: str,
     runtime_id: str,
     lease_seconds: int,
+    registry=None,
+    clock: Callable[[], int] | None = None,
+    token_factory: Callable[[], str] | None = None,
 ):
     """Stamp singleton compatibility, then advance terminal goal events once."""
     from hermes_cli import kanban_db as _kb
@@ -48,6 +51,15 @@ def _prepare_durable_goal_board_tick(
         schema_version=DURABLE_GOAL_SCHEMA_VERSION,
         protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
         lease_seconds=lease_seconds,
+    )
+    from hermes_cli.kanban_goal_operations import execute_due_operation_once
+
+    now = int(clock()) if clock is not None else None
+    execute_due_operation_once(
+        conn,
+        registry=registry,
+        now=now,
+        token_factory=token_factory,
     )
     return supervise_board_once(
         conn,

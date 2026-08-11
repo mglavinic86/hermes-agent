@@ -18,7 +18,13 @@ from hermes_cli.kanban_goal_supervisor import (
     create_trusted_durable_goal,
     list_durable_goal_tasks,
 )
-from hermes_cli.kanban_trusted_stages import TaskContract
+from hermes_cli.kanban_trusted_stages import (
+    PromotionEvidence,
+    PromotionRequest,
+    ResultClassification,
+    TaskContract,
+    TrustedStageRegistry,
+)
 
 
 @pytest.fixture
@@ -93,6 +99,163 @@ def test_singleton_board_tick_stamps_runtime_and_supervises_before_dispatch(
     assert runtime["runtime_id"] == "singleton-without-profile-identity"
     assert runtime["protocol_version"] == DURABLE_GOAL_PROTOCOL_VERSION
     assert [binding.stage for binding in bindings] == ["PLAN", "BUILD_CANDIDATE"]
+
+
+class _WatcherPassAdapter:
+    adapter_id = "fixture-adapter"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def classify(self, request: PromotionRequest) -> PromotionEvidence:
+        self.calls += 1
+        return PromotionEvidence.create(
+            adapter_id=self.adapter_id,
+            request=request,
+            classification=ResultClassification.PASS,
+            summary="watcher pass",
+        )
+
+
+def _complete_durable_task(
+    conn,
+    *,
+    task_id: str,
+    profile: str,
+    contract: TaskContract,
+    stage: str,
+    fields: dict[str, object],
+) -> None:
+    durable_fields = dict(fields)
+    if stage == "BUILD_CANDIDATE" or stage.startswith("REPAIR_BUILD_"):
+        candidate_sha = str(durable_fields.get("candidate_sha") or "").strip().lower()
+        if candidate_sha:
+            durable_fields.setdefault("candidate_tree", candidate_sha)
+            durable_fields.setdefault("branch_identity", f"turpi/{candidate_sha[:12]}")
+            durable_fields.setdefault("pr_identity", f"pr-{candidate_sha[:12]}")
+            durable_fields.setdefault("remote_base", contract.base_revision)
+            durable_fields.setdefault("remote_head", candidate_sha)
+            durable_fields.setdefault("remote_tree", durable_fields["candidate_tree"])
+            durable_fields.setdefault(
+                "deterministic_gate_evidence", {"focused-tests": "passed"}
+            )
+    task = kb.claim_task(conn, task_id, claimer=profile)
+    assert task is not None and task.current_run_id is not None
+    assert kb.complete_task(
+        conn,
+        task.id,
+        summary=f"completed {stage}",
+        metadata={
+            "durable_goal": {
+                "workflow_version": 2,
+                "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
+                "stage": stage,
+                "run_id": task.current_run_id,
+                "contract_hash": contract.contract_hash,
+                "base_revision": contract.base_revision,
+                "scope": list(contract.scope),
+                "gates": list(contract.gates),
+                "authority": profile,
+                **durable_fields,
+            }
+        },
+        expected_run_id=task.current_run_id,
+    )
+
+
+def test_singleton_board_tick_executes_due_operation_then_reconciles_once(
+    kanban_home,
+):
+    contract = TaskContract.create(
+        reference="watcher-operation",
+        objective="Execute durable verify promote from watcher",
+        base_revision="5" * 40,
+        scope=("hermes_cli/",),
+        gates=("focused-tests",),
+    )
+    adapter = _WatcherPassAdapter()
+    registry = TrustedStageRegistry(resolvers={}, adapters={"fixture-adapter": adapter})
+    with kb.connect() as conn:
+        created = create_trusted_durable_goal(
+            conn,
+            contract=contract,
+            origin=GoalOrigin(platform="telegram", chat_id="owner"),
+            board="default",
+            resolver_id="fixture-resolver",
+            verify_promote_adapter_id="fixture-adapter",
+            orchestrator_profile="orchestrator",
+            builder_profile="builder",
+            reviewer_profile="reviewer",
+            reviewer_skill_digest=None,
+            repair_budget=1,
+            review_retry_budget=1,
+        )
+        _complete_durable_task(
+            conn,
+            task_id=created.task_id,
+            profile="orchestrator",
+            contract=contract,
+            stage="PLAN",
+            fields={"decision": "PLAN_ACCEPTED"},
+        )
+        build_results = _prepare_durable_goal_board_tick(
+            conn,
+            board="default",
+            runtime_id="runtime",
+            lease_seconds=180,
+            registry=registry,
+            clock=lambda: 100,
+            token_factory=lambda: "claim-plan",
+        )
+        build_id = next(result.task_id for result in build_results if result.task_id)
+        _complete_durable_task(
+            conn,
+            task_id=build_id,
+            profile="builder",
+            contract=contract,
+            stage="BUILD_CANDIDATE",
+            fields={
+                "candidate_sha": "6" * 40,
+                "candidate_tree": "7" * 40,
+                "branch_identity": "turpi/watcher",
+                "pr_identity": "pr-watcher",
+                "remote_base": contract.base_revision,
+                "remote_head": "6" * 40,
+            },
+        )
+        _prepare_durable_goal_board_tick(
+            conn,
+            board="default",
+            runtime_id="runtime",
+            lease_seconds=180,
+            registry=registry,
+            clock=lambda: 101,
+            token_factory=lambda: "claim-waiting",
+        )
+        results = _prepare_durable_goal_board_tick(
+            conn,
+            board="default",
+            runtime_id="runtime",
+            lease_seconds=180,
+            registry=registry,
+            clock=lambda: 102,
+            token_factory=lambda: "claim-pass",
+        )
+        duplicate = _prepare_durable_goal_board_tick(
+            conn,
+            board="default",
+            runtime_id="runtime",
+            lease_seconds=180,
+            registry=registry,
+            clock=lambda: 103,
+            token_factory=lambda: "claim-dup",
+        )
+        bindings = list_durable_goal_tasks(conn, created.goal_id)
+
+    assert any(result.action == "CREATED_REVIEW" for result in results)
+    assert all(result.action == "NOOP" for result in duplicate)
+    assert [binding.stage for binding in bindings].count("REVIEW") == 1
+    assert adapter.calls == 1
 
 
 def _gateway_process_env(kanban_home: Path) -> dict[str, str]:

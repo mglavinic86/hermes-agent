@@ -16,10 +16,10 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_goal_operations import OperationState, execute_due_operation_once
 from hermes_cli.kanban_goal_supervisor import (
     DURABLE_GOAL_PROTOCOL_VERSION,
     DURABLE_GOAL_SCHEMA_VERSION,
-    apply_trusted_stage_result,
     get_durable_goal,
     list_durable_goal_tasks,
     list_goal_notifications,
@@ -270,6 +270,13 @@ kanban:
                     "stage": "BUILD_CANDIDATE",
                     "run_id": build.current_run_id,
                     "candidate_sha": candidate_sha,
+                    "candidate_tree": "b" * 40,
+                    "branch_identity": "turpi/acceptance",
+                    "pr_identity": "pr-acceptance",
+                    "remote_base": contract.base_revision,
+                    "remote_head": candidate_sha,
+                    "remote_tree": "b" * 40,
+                    "deterministic_gate_evidence": {"focused-tests": "passed"},
                     "contract_hash": contract.contract_hash,
                     "base_revision": contract.base_revision,
                     "scope": list(contract.scope),
@@ -286,20 +293,20 @@ kanban:
             runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
         )
         assert waiting.action == "AWAITING_TRUSTED_RESULT"
-        evidence = PromotionEvidence.create(
-            adapter_id="fixture-adapter",
-            request=PromotionRequest(
-                contract_hash=contract.contract_hash,
-                base_revision=contract.base_revision,
-                scope=contract.scope,
-                gates=contract.gates,
-                candidate_sha=candidate_sha,
-                attempt=0,
-            ),
-            classification=ResultClassification.PASS,
-            summary="deterministic gates passed",
+        executed = execute_due_operation_once(
+            conn,
+            registry=registry,
+            now=200,
+            token_factory=lambda: "acceptance-claim",
         )
-        review_result = apply_trusted_stage_result(conn, goal_id, evidence)
+        assert executed is not None and executed.state == OperationState.SUCCEEDED
+        review_result = supervise_goal_once(
+            conn,
+            goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        assert review_result.action == "CREATED_REVIEW"
         review = kb.claim_review_task(
             conn,
             review_result.task_id,
