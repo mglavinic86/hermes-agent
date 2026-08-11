@@ -28,7 +28,7 @@ from hermes_cli.kanban_trusted_stages import (
 )
 
 
-DURABLE_GOAL_SCHEMA_VERSION = 2
+DURABLE_GOAL_SCHEMA_VERSION = 3
 DURABLE_GOAL_PROTOCOL_VERSION = 2
 DURABLE_GOAL_WORKFLOW_VERSION = 2
 _CANDIDATE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -402,7 +402,7 @@ def _latest_completed_build_binding(conn, goal_id: str) -> Optional[DurableGoalT
     )
 
 
-def apply_trusted_stage_result(
+def _apply_trusted_stage_result(
     conn,
     goal_id: str,
     evidence: PromotionEvidence,
@@ -533,7 +533,7 @@ def _apply_terminal_goal_operation(conn, goal: DurableGoal) -> SupervisionResult
         "response_hash": row["response_hash"],
         "response_payload": row["response_payload"],
     }
-    return apply_trusted_stage_result(
+    return _apply_trusted_stage_result(
         conn,
         goal.id,
         evidence,
@@ -1513,7 +1513,22 @@ def supervise_goal_once(
             ),
         )
     if goal.schema_version != DURABLE_GOAL_SCHEMA_VERSION:
-        return SupervisionResult("NOOP", goal_id, reason="schema_mismatch")
+        reason = (
+            "durable goal schema mismatch: "
+            f"goal={goal.schema_version}, runtime={DURABLE_GOAL_SCHEMA_VERSION}"
+        )
+        blocked = kb.block_incompatible_durable_goal_schema(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            expected_schema_version=DURABLE_GOAL_SCHEMA_VERSION,
+            reason=reason,
+        )
+        return SupervisionResult(
+            "HUMAN_GATE" if blocked else "NOOP",
+            goal.id,
+            reason=reason if blocked else "transition_lost",
+        )
     if int(runtime_protocol_version) != goal.protocol_version:
         return SupervisionResult("NOOP", goal_id, reason="protocol_mismatch")
     if goal.current_stage == "VERIFY_PROMOTE":
@@ -1566,7 +1581,6 @@ __all__ = [
     "SupervisionResult",
     "create_durable_goal",
     "create_trusted_durable_goal",
-    "apply_trusted_stage_result",
     "check_durable_goal_runtime",
     "get_durable_goal",
     "list_durable_goal_tasks",

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_goal_supervisor as supervisor
 from hermes_cli.kanban_goal_operations import (
     OperationState,
     claim_due_operation,
@@ -198,6 +199,42 @@ def test_schema_and_handoff_create_stable_idempotent_operation(tmp_path, monkeyp
     assert row["request_hash"] == duplicate["request_hash"]
     assert count == 1
     assert contract.contract_hash in row["request_payload"]
+
+
+def test_operation_schema_version_blocks_active_pr4_goal_once(tmp_path, monkeypatch):
+    _setup_home(tmp_path, monkeypatch)
+    assert supervisor.DURABLE_GOAL_SCHEMA_VERSION == 3
+    assert "apply_trusted_stage_result" not in supervisor.__all__
+
+    with kb.connect() as conn:
+        created = _create_goal(conn, _contract())
+        conn.execute(
+            "UPDATE kanban_goals SET schema_version = 2 WHERE id = ?",
+            (created.goal_id,),
+        )
+        conn.commit()
+
+        first = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert first.action == "HUMAN_GATE"
+    assert first.reason == "durable goal schema mismatch: goal=2, runtime=3"
+    assert replay.action == "NOOP" and replay.reason == "terminal_goal"
+    assert goal is not None and goal.status == "BLOCKED"
+    assert goal.current_stage == "HUMAN_GATE"
+    assert [item.kind for item in notifications] == ["HUMAN_GATE"]
 
 
 def test_build_handoff_requires_exact_canonical_operation_fields(tmp_path, monkeypatch):

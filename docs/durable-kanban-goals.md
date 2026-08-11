@@ -110,6 +110,13 @@ logical dedupe key so replay does not create duplicate notifications.
 
 ## Rollout And Migration
 
+Durable operation storage is schema version 3 while the authority workflow and
+trusted evidence protocol remain version 2. This distinguishes operation-aware
+gateways from the earlier Workflow V2 runtime, which could enter taskless
+`VERIFY_PROMOTE` without creating an operation row. An active schema-2 goal
+observed by a schema-3 supervisor fails closed once to a human gate with one
+logical owner notification; it is never silently reconstructed.
+
 Every gateway instance that can acquire the machine-wide Kanban dispatcher lock
 must be upgraded before trusted V2 durable goals are enabled. Creation checks a
 fresh `kanban_goal_runtime` lease with the exact schema and protocol version

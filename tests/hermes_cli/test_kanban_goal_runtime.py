@@ -239,4 +239,7 @@ def test_v2_schema_skew_blocks_before_worker_run(kanban_home, monkeypatch):
     assert result.spawned == [] and spawned == []
     assert result.auto_blocked == [created.task_id]
     assert goal is not None and goal.status == "BLOCKED_CAPABILITY"
-    assert goal.blocked_reason == "durable goal schema mismatch: goal=1, runtime=2"
+    assert goal.blocked_reason == (
+        "durable goal schema mismatch: "
+        f"goal=1, runtime={DURABLE_GOAL_SCHEMA_VERSION}"
+    )

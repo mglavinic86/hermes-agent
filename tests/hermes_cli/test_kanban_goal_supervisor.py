@@ -14,7 +14,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_goal_supervisor import (
     DURABLE_GOAL_PROTOCOL_VERSION,
     GoalOrigin,
-    apply_trusted_stage_result,
+    _apply_trusted_stage_result,
     create_durable_goal,
     create_trusted_durable_goal,
     get_durable_goal,
@@ -309,7 +309,7 @@ def _create_goal_at_review(
         classification=ResultClassification.PASS,
         summary="deterministic gates passed",
     )
-    review_id = apply_trusted_stage_result(conn, created.goal_id, evidence).task_id
+    review_id = _apply_trusted_stage_result(conn, created.goal_id, evidence).task_id
     assert review_id is not None
     return created, review_id
 
@@ -1210,7 +1210,7 @@ def test_verify_fail_reserves_one_build_repair_and_replay_is_idempotent(
             classification=ResultClassification.REPAIRABLE_FAILURE,
             summary="acceptance check failed but a bounded repair is possible",
         )
-        adjudicate_result = apply_trusted_stage_result(conn, created.goal_id, evidence)
+        adjudicate_result = _apply_trusted_stage_result(conn, created.goal_id, evidence)
         adjudicate_goal = get_durable_goal(conn, created.goal_id)
         adjudicate_bindings = list_durable_goal_tasks(conn, created.goal_id)
 
@@ -1492,8 +1492,8 @@ def test_malformed_verify_payload_blocks_without_successor_and_notifies_once(
             summary="candidate identity does not match the built candidate",
         )
 
-        result = apply_trusted_stage_result(conn, created.goal_id, mismatched_evidence)
-        replay = apply_trusted_stage_result(conn, created.goal_id, mismatched_evidence)
+        result = _apply_trusted_stage_result(conn, created.goal_id, mismatched_evidence)
+        replay = _apply_trusted_stage_result(conn, created.goal_id, mismatched_evidence)
         goal = get_durable_goal(conn, created.goal_id)
         bindings = list_durable_goal_tasks(conn, created.goal_id)
         notifications = list_goal_notifications(conn, created.goal_id)
@@ -2772,7 +2772,7 @@ def test_exhausted_repair_budget_blocks_unrecoverable_without_successor(
             classification=ResultClassification.REPAIRABLE_FAILURE,
             summary="deterministic evidence allows a bounded repair",
         )
-        adjudicate = apply_trusted_stage_result(conn, created.goal_id, evidence)
+        adjudicate = _apply_trusted_stage_result(conn, created.goal_id, evidence)
         assert adjudicate.action == "CREATED_ADJUDICATE"
         assert adjudicate.task_id is not None
         _complete_v2_task(

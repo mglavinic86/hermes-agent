@@ -5176,6 +5176,78 @@ def block_legacy_durable_goal_under_v2(
     return True
 
 
+def block_incompatible_durable_goal_schema(
+    conn: sqlite3.Connection,
+    *,
+    goal_id: str,
+    expected_state_version: int,
+    expected_schema_version: int,
+    reason: str,
+) -> bool:
+    """Atomically stop an active goal created by an incompatible runtime schema."""
+    reason = str(reason or "").strip()
+    if not reason:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        goal = conn.execute(
+            "SELECT * FROM kanban_goals WHERE id = ?", (goal_id,)
+        ).fetchone()
+        if (
+            goal is None
+            or goal["status"] != "ACTIVE"
+            or int(goal["schema_version"] or 1) == int(expected_schema_version)
+            or int(goal["state_version"]) != int(expected_state_version)
+        ):
+            return False
+        updated = conn.execute(
+            "UPDATE kanban_goals SET status = 'BLOCKED', "
+            "current_stage = 'HUMAN_GATE', blocked_reason = ?, "
+            "state_version = state_version + 1, updated_at = ? "
+            "WHERE id = ? AND status = 'ACTIVE' AND state_version = ? "
+            "AND COALESCE(schema_version, 1) != ?",
+            (
+                reason,
+                now,
+                goal_id,
+                int(expected_state_version),
+                int(expected_schema_version),
+            ),
+        )
+        if updated.rowcount != 1:
+            return False
+        payload = {
+            "goal_id": goal_id,
+            "objective": goal["objective"],
+            "candidate_sha": goal["candidate_sha"],
+            "status": "BLOCKED",
+            "reason": reason,
+        }
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_goal_notification_outbox (
+                goal_id, kind, dedupe_key, payload,
+                platform, chat_id, chat_type, thread_id, user_id,
+                notifier_profile, delivery_metadata, created_at
+            ) VALUES (?, 'HUMAN_GATE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                goal_id,
+                f"durable-goal:{goal_id}:SCHEMA_MISMATCH_HUMAN_GATE",
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                goal["origin_platform"],
+                goal["origin_chat_id"],
+                goal["origin_chat_type"],
+                goal["origin_thread_id"],
+                goal["origin_user_id"],
+                goal["notifier_profile"],
+                goal["delivery_metadata"],
+                now,
+            ),
+        )
+    return True
+
+
 def _claimer_id() -> str:
     """Return a ``host:pid`` string that identifies this claimer."""
     import socket
