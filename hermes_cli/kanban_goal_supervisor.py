@@ -100,6 +100,12 @@ class DurableGoalTask:
 
 
 @dataclass(frozen=True)
+class _ValidatedReviewEvidence:
+    payload: dict[str, Any]
+    snapshot: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class DurableGoalCreated:
     goal_id: str
     task_id: str
@@ -798,7 +804,7 @@ def _validated_current_review_payload(
     *,
     goal: DurableGoal,
     adjudicate_binding: DurableGoalTask,
-) -> Optional[dict[str, Any]]:
+) -> Optional[_ValidatedReviewEvidence]:
     rows = conn.execute(
         "SELECT * FROM kanban_goal_tasks "
         "WHERE goal_id = ? AND (stage = 'REVIEW' OR stage LIKE 'REVIEW_RETRY_%') "
@@ -825,6 +831,10 @@ def _validated_current_review_payload(
         or int(event["run_id"]) != review_binding.expected_run_id
     ):
         return None
+    task = kb.get_task(conn, review_binding.task_id)
+    run = kb.get_run(conn, int(event["run_id"]))
+    if task is None or run is None:
+        return None
     authoritative = _structured_v2_authority_payload(
         conn,
         goal,
@@ -837,7 +847,74 @@ def _validated_current_review_payload(
     authoritative = _validate_review_payload(authoritative, goal)
     if authoritative is None or review_binding.completion_payload != authoritative:
         return None
-    return authoritative
+    return _ValidatedReviewEvidence(
+        payload=authoritative,
+        snapshot={
+            "binding": {
+                "goal_id": review_binding.goal_id,
+                "task_id": review_binding.task_id,
+                "stage": review_binding.stage,
+                "attempt": review_binding.attempt,
+                "expected_run_id": review_binding.expected_run_id,
+                "expected_candidate_sha": review_binding.expected_candidate_sha,
+                "completion_event_id": review_binding.completion_event_id,
+                "completion_payload": review_binding.completion_payload,
+            },
+            "task": {
+                "id": task.id,
+                "assignee": task.assignee,
+                "status": task.status,
+                "current_run_id": task.current_run_id,
+            },
+            "event": {
+                "id": int(event["id"]),
+                "task_id": str(event["task_id"]),
+                "run_id": int(event["run_id"]),
+                "kind": str(event["kind"]),
+                "payload": event["payload"],
+            },
+            "run": {
+                "id": run.id,
+                "task_id": run.task_id,
+                "profile": run.profile,
+                "status": run.status,
+                "ended_at": run.ended_at,
+                "outcome": run.outcome,
+                "metadata": run.metadata,
+            },
+        },
+    )
+
+
+def _ready_authority_snapshot(
+    goal: DurableGoal,
+    adjudicate_binding: DurableGoalTask,
+    review: _ValidatedReviewEvidence,
+) -> dict[str, Any]:
+    contract = goal.task_contract
+    assert contract is not None
+    assert isinstance(goal.promotion_evidence, Mapping)
+    return {
+        "goal": {
+            "current_stage": goal.current_stage,
+            "candidate_sha": goal.candidate_sha,
+            "task_contract": contract.as_payload(),
+            "verify_promote_adapter_id": goal.verify_promote_adapter_id,
+            "promotion_evidence": dict(goal.promotion_evidence),
+            "reviewer_profile": goal.reviewer_profile,
+            "reviewer_skill_digest": goal.reviewer_skill_digest,
+        },
+        "adjudicate_binding": {
+            "goal_id": adjudicate_binding.goal_id,
+            "task_id": adjudicate_binding.task_id,
+            "stage": adjudicate_binding.stage,
+            "attempt": adjudicate_binding.attempt,
+            "expected_run_id": adjudicate_binding.expected_run_id,
+            "expected_candidate_sha": adjudicate_binding.expected_candidate_sha,
+            "completion_event_id": adjudicate_binding.completion_event_id,
+        },
+        "review": review.snapshot,
+    }
 
 
 def _validated_current_promotion_evidence(
@@ -1159,12 +1236,12 @@ def _supervise_v2_goal_once(
                     reason="invalid_promotion_evidence",
                     notification_kind="HUMAN_GATE",
                 )
-            review_payload = _validated_current_review_payload(
+            review = _validated_current_review_payload(
                 conn,
                 goal=goal,
                 adjudicate_binding=binding,
             )
-            if review_payload is None:
+            if review is None:
                 return _block_v2_goal_from_current_event(
                     conn,
                     goal,
@@ -1173,6 +1250,7 @@ def _supervise_v2_goal_once(
                     reason="invalid_review_evidence",
                     notification_kind="HUMAN_GATE",
                 )
+            review_payload = review.payload
             if (
                 str(review_payload.get("verdict") or "") != ReviewVerdict.APPROVE.value
                 or str(review_payload.get("candidate_sha") or "") != candidate_sha
@@ -1191,6 +1269,9 @@ def _supervise_v2_goal_once(
                 expected_run_id=int(event["run_id"]),
                 completion_payload=payload,
                 terminal_status="READY_FOR_OWNER",
+                ready_authority_snapshot=_ready_authority_snapshot(
+                    goal, binding, review
+                ),
                 notification_kind="READY_FOR_OWNER",
                 notification_payload={
                     "goal_id": goal.id,
@@ -1200,7 +1281,14 @@ def _supervise_v2_goal_once(
                 },
             )
             if not transitioned:
-                return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+                return _block_v2_goal_from_current_event(
+                    conn,
+                    goal,
+                    binding,
+                    event,
+                    reason="ready_authority_changed",
+                    notification_kind="HUMAN_GATE",
+                )
             return SupervisionResult("READY_FOR_OWNER", goal.id, binding.task_id)
         if decision == AdjudicationDecision.REPAIR:
             next_attempt = goal.repair_attempts_reserved + 1

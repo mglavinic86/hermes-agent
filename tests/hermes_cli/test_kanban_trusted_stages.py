@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
 import sqlite3
+import threading
+import time
 from typing import cast
 
 import pytest
@@ -164,6 +167,51 @@ def _create_goal_at_review(
     review_id = apply_trusted_stage_result(conn, created.goal_id, evidence).task_id
     assert review_id is not None
     return created, review_id
+
+
+def _create_goal_at_ready_adjudication(
+    conn,
+    *,
+    contract: TaskContract,
+    candidate_sha: str,
+):
+    created, review_id = _create_goal_at_review(
+        conn,
+        contract=contract,
+        candidate_sha=candidate_sha,
+    )
+    _complete_bound_task(
+        conn,
+        task_id=review_id,
+        profile="reviewer",
+        contract=contract,
+        stage="REVIEW",
+        fields={
+            "candidate_sha": candidate_sha,
+            "verdict": "APPROVE",
+            "findings": [{"severity": "MINOR", "summary": "ok"}],
+            "reviewer_skill_digest": "f" * 64,
+        },
+    )
+    adjudicate_id = supervise_goal_once(
+        conn,
+        created.goal_id,
+        board="default",
+        runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+    ).task_id
+    assert adjudicate_id is not None
+    _complete_bound_task(
+        conn,
+        task_id=adjudicate_id,
+        profile="orchestrator",
+        contract=contract,
+        stage="ADJUDICATE",
+        fields={
+            "candidate_sha": candidate_sha,
+            "decision": "READY_FOR_OWNER",
+        },
+    )
+    return created, review_id, adjudicate_id
 
 
 def _create_goal_at_repair(
@@ -1083,6 +1131,265 @@ def test_adjudicate_ready_requires_pass_approved_current_candidate_without_major
         notifications = list_goal_notifications(conn, created.goal_id)
 
     assert result.action == "READY_FOR_OWNER"
+    assert replay.action == "NOOP"
+    assert goal is not None and goal.status == "READY_FOR_OWNER"
+    assert [notification.kind for notification in notifications] == ["READY_FOR_OWNER"]
+
+
+@pytest.mark.parametrize("mutation", ["classification", "adapter_id"])
+def test_ready_cas_blocks_promotion_mutation_after_validation(
+    tmp_path, monkeypatch, mutation
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    contract = TaskContract.create(
+        reference=f"issue:promotion-race-{mutation}",
+        objective="Bind READY to the validated promotion snapshot",
+        base_revision="a" * 40,
+        scope=("hermes_cli/",),
+        gates=("focused-tests",),
+    )
+    candidate_sha = "b" * 40
+
+    with kb.connect() as conn:
+        created, _, _ = _create_goal_at_ready_adjudication(
+            conn, contract=contract, candidate_sha=candidate_sha
+        )
+        original_transition = kb.transition_durable_goal_to_terminal
+        raced = False
+
+        def transition_with_race(connection, **kwargs):
+            nonlocal raced
+            if kwargs.get("terminal_status") == "READY_FOR_OWNER" and not raced:
+                raced = True
+                with kb.connect() as other:
+                    row = other.execute(
+                        "SELECT promotion_evidence FROM kanban_goals WHERE id = ?",
+                        (created.goal_id,),
+                    ).fetchone()
+                    evidence = json.loads(row["promotion_evidence"])
+                    if mutation == "classification":
+                        evidence["classification"] = "HARD_BLOCK"
+                    else:
+                        evidence["adapter_id"] = "forged-adapter"
+                    other.execute(
+                        "UPDATE kanban_goals SET promotion_evidence = ? WHERE id = ?",
+                        (json.dumps(evidence, sort_keys=True), created.goal_id),
+                    )
+                    other.commit()
+            return original_transition(connection, **kwargs)
+
+        monkeypatch.setattr(
+            kb, "transition_durable_goal_to_terminal", transition_with_race
+        )
+        first = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert raced
+    assert first.action == "BLOCKED"
+    assert first.reason == "ready_authority_changed"
+    assert replay.action == "NOOP"
+    assert goal is not None and goal.status == "BLOCKED"
+    assert [notification.kind for notification in notifications] == ["HUMAN_GATE"]
+
+
+@pytest.mark.parametrize(
+    "mutation", ["completion_payload", "assignee", "run_profile", "event_kind"]
+)
+def test_ready_cas_blocks_review_mutation_after_validation(
+    tmp_path, monkeypatch, mutation
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    contract = TaskContract.create(
+        reference=f"issue:review-race-{mutation}",
+        objective="Bind READY to the validated review snapshot",
+        base_revision="c" * 40,
+        scope=("hermes_cli/",),
+        gates=("focused-tests",),
+    )
+    candidate_sha = "d" * 40
+
+    with kb.connect() as conn:
+        created, review_id, _ = _create_goal_at_ready_adjudication(
+            conn, contract=contract, candidate_sha=candidate_sha
+        )
+        original_transition = kb.transition_durable_goal_to_terminal
+        raced = False
+
+        def transition_with_race(connection, **kwargs):
+            nonlocal raced
+            if kwargs.get("terminal_status") == "READY_FOR_OWNER" and not raced:
+                raced = True
+                with kb.connect() as other:
+                    if mutation == "completion_payload":
+                        row = other.execute(
+                            "SELECT completion_payload FROM kanban_goal_tasks "
+                            "WHERE goal_id = ? AND task_id = ?",
+                            (created.goal_id, review_id),
+                        ).fetchone()
+                        payload = json.loads(row["completion_payload"])
+                        payload["verdict"] = "CHANGES_REQUIRED"
+                        payload["findings"] = [
+                            {
+                                "severity": "BLOCKER",
+                                "summary": "injected after validation",
+                                "resolved": False,
+                            }
+                        ]
+                        other.execute(
+                            "UPDATE kanban_goal_tasks SET completion_payload = ? "
+                            "WHERE goal_id = ? AND task_id = ?",
+                            (
+                                json.dumps(payload, sort_keys=True),
+                                created.goal_id,
+                                review_id,
+                            ),
+                        )
+                    elif mutation == "assignee":
+                        other.execute(
+                            "UPDATE tasks SET assignee = 'forged-reviewer' WHERE id = ?",
+                            (review_id,),
+                        )
+                    elif mutation == "run_profile":
+                        other.execute(
+                            "UPDATE task_runs SET profile = 'forged-reviewer' "
+                            "WHERE id = (SELECT expected_run_id FROM kanban_goal_tasks "
+                            "WHERE goal_id = ? AND task_id = ?)",
+                            (created.goal_id, review_id),
+                        )
+                    else:
+                        other.execute(
+                            "UPDATE task_events SET kind = 'blocked' "
+                            "WHERE id = (SELECT completion_event_id "
+                            "FROM kanban_goal_tasks WHERE goal_id = ? AND task_id = ?)",
+                            (created.goal_id, review_id),
+                        )
+                    other.commit()
+            return original_transition(connection, **kwargs)
+
+        monkeypatch.setattr(
+            kb, "transition_durable_goal_to_terminal", transition_with_race
+        )
+        first = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert raced
+    assert first.action == "BLOCKED"
+    assert first.reason == "ready_authority_changed"
+    assert replay.action == "NOOP"
+    assert goal is not None and goal.status == "BLOCKED"
+    assert [notification.kind for notification in notifications] == ["HUMAN_GATE"]
+
+
+def test_ready_write_lock_serializes_concurrent_evidence_writer(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    contract = TaskContract.create(
+        reference="issue:ready-write-lock",
+        objective="Serialize READY and concurrent evidence writers",
+        base_revision="e" * 40,
+        scope=("hermes_cli/",),
+        gates=("focused-tests",),
+    )
+    candidate_sha = "f" * 40
+    writer_attempted = threading.Event()
+    writer_done = threading.Event()
+    writer_errors: list[BaseException] = []
+    writer_threads: list[threading.Thread] = []
+
+    with kb.connect() as conn:
+        created, _, _ = _create_goal_at_ready_adjudication(
+            conn, contract=contract, candidate_sha=candidate_sha
+        )
+        original_write_txn = kb.write_txn
+        armed = True
+
+        @contextlib.contextmanager
+        def interposed_write_txn(connection, **kwargs):
+            nonlocal armed
+            with original_write_txn(connection, **kwargs):
+                if armed:
+                    armed = False
+
+                    def concurrent_writer():
+                        try:
+                            with kb.connect() as other:
+                                other.execute("PRAGMA busy_timeout = 5000")
+                                writer_attempted.set()
+                                other.execute(
+                                    "UPDATE kanban_goals SET promotion_evidence = '{}' "
+                                    "WHERE id = ?",
+                                    (created.goal_id,),
+                                )
+                                other.commit()
+                        except BaseException as exc:  # pragma: no cover - assertion aid
+                            writer_errors.append(exc)
+                        finally:
+                            writer_done.set()
+
+                    thread = threading.Thread(target=concurrent_writer, daemon=True)
+                    writer_threads.append(thread)
+                    thread.start()
+                    assert writer_attempted.wait(timeout=2)
+                    time.sleep(0.05)
+                    assert not writer_done.is_set()
+                yield connection
+
+        monkeypatch.setattr(kb, "write_txn", interposed_write_txn)
+        first = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        assert writer_threads
+        writer_threads[0].join(timeout=5)
+        assert writer_done.is_set()
+        replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert writer_errors == []
+    assert first.action == "READY_FOR_OWNER"
     assert replay.action == "NOOP"
     assert goal is not None and goal.status == "READY_FOR_OWNER"
     assert [notification.kind for notification in notifications] == ["READY_FOR_OWNER"]

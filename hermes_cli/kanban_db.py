@@ -4071,6 +4071,127 @@ def transition_durable_goal_waiting_to_terminal(
     return True
 
 
+def _json_snapshot_value(raw: Any) -> Any:
+    if raw is None:
+        return None
+    try:
+        return json.loads(str(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return object()
+
+
+def _ready_authority_snapshot_matches(
+    conn: sqlite3.Connection,
+    *,
+    goal: sqlite3.Row,
+    adjudicate_binding: sqlite3.Row,
+    snapshot: Mapping[str, Any],
+) -> bool:
+    """Compare already-validated authority rows inside the READY write txn."""
+    try:
+        expected_goal = snapshot["goal"]
+        expected_adjudicate = snapshot["adjudicate_binding"]
+        expected_review = snapshot["review"]
+        expected_review_binding = expected_review["binding"]
+        expected_task = expected_review["task"]
+        expected_event = expected_review["event"]
+        expected_run = expected_review["run"]
+    except (KeyError, TypeError):
+        return False
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            expected_goal,
+            expected_adjudicate,
+            expected_review,
+            expected_review_binding,
+            expected_task,
+            expected_event,
+            expected_run,
+        )
+    ):
+        return False
+    if (
+        goal["current_stage"] != expected_goal.get("current_stage")
+        or goal["candidate_sha"] != expected_goal.get("candidate_sha")
+        or _json_snapshot_value(goal["task_contract_json"])
+        != expected_goal.get("task_contract")
+        or goal["verify_promote_adapter_id"]
+        != expected_goal.get("verify_promote_adapter_id")
+        or _json_snapshot_value(goal["promotion_evidence"])
+        != expected_goal.get("promotion_evidence")
+        or goal["reviewer_profile"] != expected_goal.get("reviewer_profile")
+        or goal["reviewer_skill_digest"] != expected_goal.get("reviewer_skill_digest")
+    ):
+        return False
+    if any(
+        adjudicate_binding[column] != expected_adjudicate.get(column)
+        for column in (
+            "goal_id",
+            "task_id",
+            "stage",
+            "attempt",
+            "expected_run_id",
+            "expected_candidate_sha",
+            "completion_event_id",
+        )
+    ):
+        return False
+    review_binding = conn.execute(
+        "SELECT * FROM kanban_goal_tasks WHERE goal_id = ? AND task_id = ?",
+        (
+            expected_review_binding.get("goal_id"),
+            expected_review_binding.get("task_id"),
+        ),
+    ).fetchone()
+    if review_binding is None or any(
+        review_binding[column] != expected_review_binding.get(column)
+        for column in (
+            "goal_id",
+            "task_id",
+            "stage",
+            "attempt",
+            "expected_run_id",
+            "expected_candidate_sha",
+            "completion_event_id",
+        )
+    ):
+        return False
+    if _json_snapshot_value(review_binding["completion_payload"]) != (
+        expected_review_binding.get("completion_payload")
+    ):
+        return False
+    task = conn.execute(
+        "SELECT id, assignee, status, current_run_id FROM tasks WHERE id = ?",
+        (expected_task.get("id"),),
+    ).fetchone()
+    if task is None or any(
+        task[column] != expected_task.get(column)
+        for column in ("id", "assignee", "status", "current_run_id")
+    ):
+        return False
+    event = conn.execute(
+        "SELECT id, task_id, run_id, kind, payload FROM task_events WHERE id = ?",
+        (expected_event.get("id"),),
+    ).fetchone()
+    if event is None or any(
+        event[column] != expected_event.get(column)
+        for column in ("id", "task_id", "run_id", "kind", "payload")
+    ):
+        return False
+    run = conn.execute(
+        "SELECT id, task_id, profile, status, ended_at, outcome, metadata "
+        "FROM task_runs WHERE id = ?",
+        (expected_run.get("id"),),
+    ).fetchone()
+    if run is None or any(
+        run[column] != expected_run.get(column)
+        for column in ("id", "task_id", "profile", "status", "ended_at", "outcome")
+    ):
+        return False
+    return _json_snapshot_value(run["metadata"]) == expected_run.get("metadata")
+
+
 def transition_durable_goal_to_terminal(
     conn: sqlite3.Connection,
     *,
@@ -4083,6 +4204,7 @@ def transition_durable_goal_to_terminal(
     terminal_status: str,
     notification_kind: str,
     notification_payload: Mapping[str, Any],
+    ready_authority_snapshot: Optional[Mapping[str, Any]] = None,
     blocked_reason: Optional[str] = None,
 ) -> bool:
     """CAS a goal into a durable terminal/owner state and enqueue once."""
@@ -4110,8 +4232,7 @@ def transition_durable_goal_to_terminal(
         ):
             return False
         binding = conn.execute(
-            "SELECT completion_event_id FROM kanban_goal_tasks "
-            "WHERE goal_id = ? AND task_id = ?",
+            "SELECT * FROM kanban_goal_tasks WHERE goal_id = ? AND task_id = ?",
             (goal_id, predecessor_task_id),
         ).fetchone()
         if binding is None or binding["completion_event_id"] is not None:
@@ -4130,6 +4251,16 @@ def transition_durable_goal_to_terminal(
             conn,
             task_id=predecessor_task_id,
             run_id=run_id,
+        ):
+            return False
+        if terminal_status == "READY_FOR_OWNER" and (
+            not isinstance(ready_authority_snapshot, Mapping)
+            or not _ready_authority_snapshot_matches(
+                conn,
+                goal=goal,
+                adjudicate_binding=binding,
+                snapshot=ready_authority_snapshot,
+            )
         ):
             return False
         updated_binding = conn.execute(
