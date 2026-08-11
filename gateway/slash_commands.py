@@ -2845,11 +2845,14 @@ class GatewaySlashCommandsMixin:
 
             try:
                 created = await asyncio.to_thread(_create_durable_goal)
-            except (ValueError, OSError) as exc:
+            except ValueError as exc:
                 return f"Durable goal unavailable: {exc}"
-            except Exception as exc:
+            except Exception:
                 logger.exception("durable goal creation failed")
-                return f"Durable goal unavailable: {exc}"
+                return (
+                    "Durable goal unavailable due to an internal error. "
+                    "No goal was created."
+                )
             return (
                 f"Durable goal created {created.goal_id} (BUILD task "
                 f"{created.task_id}). Progress is supervised by Kanban; "

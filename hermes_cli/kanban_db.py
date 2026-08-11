@@ -1450,6 +1450,7 @@ CREATE TABLE IF NOT EXISTS kanban_goal_notification_outbox (
     delivered_at      INTEGER,
     delivery_attempts INTEGER NOT NULL DEFAULT 0,
     last_error        TEXT,
+    next_attempt_at   INTEGER,
     created_at        INTEGER NOT NULL,
     FOREIGN KEY (goal_id) REFERENCES kanban_goals(id)
 );
@@ -2651,6 +2652,33 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "reviewer_skill_digest TEXT",
             )
 
+    goal_outbox_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='kanban_goal_notification_outbox'"
+    ).fetchone() is not None
+    if goal_outbox_table_exists:
+        goal_outbox_cols = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(kanban_goal_notification_outbox)"
+            )
+        }
+        if "next_attempt_at" not in goal_outbox_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_goal_notification_outbox",
+                "next_attempt_at",
+                "next_attempt_at INTEGER",
+            )
+        # This index must follow the additive column migration: putting it in
+        # SCHEMA_SQL would make initialization of legacy boards fail before
+        # ``next_attempt_at`` exists.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_goal_outbox_due "
+            "ON kanban_goal_notification_outbox"
+            "(delivered_at, next_attempt_at, claimed_at, id)"
+        )
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -3695,6 +3723,21 @@ def clear_durable_goal_runtime(
 
 
 DURABLE_GOAL_NOTIFICATION_CLAIM_TIMEOUT_SECONDS = 120
+DURABLE_GOAL_NOTIFICATION_RETRY_BASE_SECONDS = 5
+DURABLE_GOAL_NOTIFICATION_RETRY_CAP_SECONDS = 3600
+
+
+def _durable_goal_notification_retry_delay(delivery_attempts: int) -> int:
+    """Return the bounded retry delay after the current claimed attempt."""
+    attempts = max(1, int(delivery_attempts))
+    exponent = min(
+        attempts - 1,
+        DURABLE_GOAL_NOTIFICATION_RETRY_CAP_SECONDS.bit_length(),
+    )
+    return min(
+        DURABLE_GOAL_NOTIFICATION_RETRY_CAP_SECONDS,
+        DURABLE_GOAL_NOTIFICATION_RETRY_BASE_SECONDS * (2**exponent),
+    )
 
 
 def claim_pending_durable_goal_notifications(
@@ -3705,7 +3748,7 @@ def claim_pending_durable_goal_notifications(
     claim_timeout_seconds: int = DURABLE_GOAL_NOTIFICATION_CLAIM_TIMEOUT_SECONDS,
     now: Optional[int] = None,
 ) -> list[sqlite3.Row]:
-    """Reserve pending durable goal owner notifications for one delivery tick."""
+    """Reserve due notifications; ``max_attempts`` is compatibility-only."""
     current_time = int(time.time()) if now is None else int(now)
     timeout = max(1, int(claim_timeout_seconds))
     expired_before = current_time - timeout
@@ -3721,11 +3764,14 @@ def claim_pending_durable_goal_notifications(
                     claim_token IS NULL
                     OR COALESCE(claimed_at, 0) <= ?
                )
-               AND delivery_attempts < ?
+               AND (
+                    next_attempt_at IS NULL
+                    OR next_attempt_at <= ?
+               )
              ORDER BY id
              LIMIT ?
             """,
-            (expired_before, int(max_attempts), int(limit)),
+            (expired_before, current_time, int(limit)),
         ).fetchall()
         for row in rows:
             updated = conn.execute(
@@ -3743,7 +3789,10 @@ def claim_pending_durable_goal_notifications(
                             AND COALESCE(claimed_at, 0) <= ?
                         )
                    )
-                   AND delivery_attempts < ?
+                   AND (
+                        next_attempt_at IS NULL
+                        OR next_attempt_at <= ?
+                   )
                 """,
                 (
                     claim_token,
@@ -3751,7 +3800,7 @@ def claim_pending_durable_goal_notifications(
                     int(row["id"]),
                     str(row["claim_token"] or ""),
                     expired_before,
-                    int(max_attempts),
+                    current_time,
                 ),
             )
             if updated.rowcount == 1:
@@ -3772,13 +3821,14 @@ def count_pending_durable_goal_notifications(
     claim_timeout_seconds: int = DURABLE_GOAL_NOTIFICATION_CLAIM_TIMEOUT_SECONDS,
     now: Optional[int] = None,
 ) -> int:
-    """Count undelivered durable goal owner notifications via read-only DB open."""
+    """Count every undelivered notification, including leased and future-due rows.
+
+    Retry/lease arguments remain accepted for source compatibility but do not
+    hide operationally pending rows from health checks.
+    """
     path = db_path if db_path is not None else kanban_db_path(board=board)
     if not path.exists():
         return 0
-    current_time = int(time.time()) if now is None else int(now)
-    timeout = max(1, int(claim_timeout_seconds))
-    expired_before = current_time - timeout
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         try:
@@ -3787,13 +3837,7 @@ def count_pending_durable_goal_notifications(
                 SELECT COUNT(*)
                   FROM kanban_goal_notification_outbox
                  WHERE delivered_at IS NULL
-                   AND (
-                        claim_token IS NULL
-                        OR COALESCE(claimed_at, 0) <= ?
-                   )
-                   AND delivery_attempts < ?
                 """,
-                (expired_before, int(max_attempts)),
             ).fetchone()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
@@ -3818,7 +3862,8 @@ def mark_durable_goal_notification_delivered(
                SET delivered_at = ?,
                    claim_token = NULL,
                    claimed_at = NULL,
-                   last_error = NULL
+                   last_error = NULL,
+                   next_attempt_at = NULL
              WHERE id = ?
                AND claim_token = ?
                AND delivered_at IS NULL
@@ -3834,19 +3879,38 @@ def release_durable_goal_notification_claim(
     notification_id: int,
     claim_token: str,
     error: str,
+    now: Optional[int] = None,
 ) -> bool:
+    current_time = int(time.time()) if now is None else int(now)
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT delivery_attempts "
+            "FROM kanban_goal_notification_outbox "
+            "WHERE id = ? AND claim_token = ? AND delivered_at IS NULL",
+            (int(notification_id), str(claim_token)),
+        ).fetchone()
+        if row is None:
+            return False
+        next_attempt_at = current_time + _durable_goal_notification_retry_delay(
+            int(row["delivery_attempts"])
+        )
         updated = conn.execute(
             """
             UPDATE kanban_goal_notification_outbox
                SET claim_token = NULL,
                    claimed_at = NULL,
-                   last_error = ?
+                   last_error = ?,
+                   next_attempt_at = ?
              WHERE id = ?
                AND claim_token = ?
                AND delivered_at IS NULL
             """,
-            (str(error or "")[:500], int(notification_id), str(claim_token)),
+            (
+                str(error or "")[:500],
+                next_attempt_at,
+                int(notification_id),
+                str(claim_token),
+            ),
         )
     return updated.rowcount == 1
 

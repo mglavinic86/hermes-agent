@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -122,6 +123,88 @@ kanban:
     assert goal.origin.message_id == "origin-message-1"
     assert goal.reviewer_skill_digest == PINNED_REVIEWER_DIGEST
     assert runner._queued_events == {}
+
+
+@pytest.mark.asyncio
+async def test_goal_durable_create_internal_error_is_logged_without_chat_leak(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+kanban:
+  durable_goals:
+    builder_profile: turpi_builder
+    verifier_profile: turpi_verify
+    reviewer_profile: turpi_review
+    reviewer_skill_digest: 1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        kb.upsert_durable_goal_runtime(
+            conn,
+            runtime_id="compatible-singleton",
+            schema_version=DURABLE_GOAL_SCHEMA_VERSION,
+            protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+            lease_seconds=300,
+        )
+    repo = tmp_path / "candidate-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+
+    sensitive_error = (
+        "permission denied reading /private/secret/.hermes/config.yaml "
+        "with token=fake-sensitive-token"
+    )
+    from hermes_cli import kanban_goal_supervisor
+
+    def _raise_sensitive_os_error(*_args, **_kwargs):
+        raise OSError(sensitive_error)
+
+    monkeypatch.setattr(
+        kanban_goal_supervisor,
+        "create_durable_goal",
+        _raise_sensitive_os_error,
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _SessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+    runner._active_profile_name = lambda: "gateway-owner"
+    event = MessageEvent(
+        text="/goal durable Do not expose internal failures",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="owner-chat",
+            chat_type="dm",
+            user_id="owner-7",
+            profile="gateway-owner",
+        ),
+        message_id="origin-internal-error",
+    )
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        response = await GatewayRunner._handle_goal_command(runner, event)
+
+    assert response == (
+        "Durable goal unavailable due to an internal error. No goal was created."
+    )
+    assert sensitive_error in caplog.text
+    assert "/private/secret" not in response
+    assert "fake-sensitive-token" not in response
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM kanban_goals").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio
