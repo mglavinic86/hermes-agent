@@ -15,9 +15,10 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_goal_supervisor import (
     DURABLE_GOAL_PROTOCOL_VERSION,
     GoalOrigin,
-    create_durable_goal,
+    create_trusted_durable_goal,
     list_durable_goal_tasks,
 )
+from hermes_cli.kanban_trusted_stages import TaskContract
 
 
 @pytest.fixture
@@ -33,35 +34,49 @@ def kanban_home(tmp_path, monkeypatch):
 def test_singleton_board_tick_stamps_runtime_and_supervises_before_dispatch(
     kanban_home,
 ):
-    candidate_sha = "4" * 40
+    contract = TaskContract.create(
+        reference="watcher-contract",
+        objective="Advance before the dispatcher scans successors",
+        base_revision="4" * 40,
+        scope=("hermes_cli/",),
+        gates=("focused-tests",),
+    )
     with kb.connect() as conn:
-        created = create_durable_goal(
+        created = create_trusted_durable_goal(
             conn,
-            objective="Advance before the dispatcher scans successors",
+            contract=contract,
             origin=GoalOrigin(platform="telegram", chat_id="owner"),
             board="default",
+            resolver_id="fixture-resolver",
+            verify_promote_adapter_id="fixture-adapter",
+            orchestrator_profile="orchestrator",
             builder_profile="builder",
-            verifier_profile="verifier",
             reviewer_profile="reviewer",
+            reviewer_skill_digest=None,
             repair_budget=1,
             review_retry_budget=1,
         )
-        build = kb.claim_task(conn, created.task_id, claimer="builder")
-        assert build is not None and build.current_run_id is not None
+        plan = kb.claim_task(conn, created.task_id, claimer="orchestrator")
+        assert plan is not None and plan.current_run_id is not None
         assert kb.complete_task(
             conn,
-            build.id,
-            summary="built",
+            plan.id,
+            summary="planned",
             metadata={
                 "durable_goal": {
+                    "workflow_version": 2,
                     "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
-                    "stage": "BUILD",
-                    "run_id": build.current_run_id,
-                    "candidate_sha": candidate_sha,
-                    "outcome": "BUILT",
+                    "stage": "PLAN",
+                    "run_id": plan.current_run_id,
+                    "decision": "PLAN_ACCEPTED",
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "orchestrator",
                 }
             },
-            expected_run_id=build.current_run_id,
+            expected_run_id=plan.current_run_id,
         )
 
         results = _prepare_durable_goal_board_tick(
@@ -77,7 +92,7 @@ def test_singleton_board_tick_stamps_runtime_and_supervises_before_dispatch(
     assert runtime is not None
     assert runtime["runtime_id"] == "singleton-without-profile-identity"
     assert runtime["protocol_version"] == DURABLE_GOAL_PROTOCOL_VERSION
-    assert [binding.stage for binding in bindings] == ["BUILD", "VERIFY"]
+    assert [binding.stage for binding in bindings] == ["PLAN", "BUILD_CANDIDATE"]
 
 
 def _gateway_process_env(kanban_home: Path) -> dict[str, str]:
@@ -110,6 +125,7 @@ def _run_gateway_harness(
     return completed, payload
 
 
+@pytest.mark.live_system_guard_bypass
 def test_real_gateway_process_restart_reacquires_lock_lease_and_dedupes_successor(
     kanban_home,
 ):
@@ -120,39 +136,53 @@ def test_real_gateway_process_restart_reacquires_lock_lease_and_dedupes_successo
         "  auto_decompose: false\n"
         "  max_in_progress: 1\n"
     )
-    candidate_sha = "7" * 40
+    contract = TaskContract.create(
+        reference="watcher-restart-contract",
+        objective="Resume a terminal plan after a real gateway crash",
+        base_revision="7" * 40,
+        scope=("hermes_cli/",),
+        gates=("focused-tests",),
+    )
     with kb.connect() as conn:
         # Keep the actual dispatcher from spawning a profile worker; the test
         # exercises lock/lease/supervisor restart semantics, not child exec.
         guard_id = kb.create_task(conn, title="running guard", assignee="guard")
         assert kb.claim_task(conn, guard_id, claimer="guard") is not None
-        created = create_durable_goal(
+        created = create_trusted_durable_goal(
             conn,
-            objective="Resume a terminal build after a real gateway crash",
+            contract=contract,
             origin=GoalOrigin(platform="telegram", chat_id="owner"),
             board="default",
+            resolver_id="fixture-resolver",
+            verify_promote_adapter_id="fixture-adapter",
+            orchestrator_profile="orchestrator",
             builder_profile="builder",
-            verifier_profile="verifier",
             reviewer_profile="reviewer",
+            reviewer_skill_digest=None,
             repair_budget=1,
             review_retry_budget=1,
         )
-        build = kb.claim_task(conn, created.task_id, claimer="builder")
-        assert build is not None and build.current_run_id is not None
+        plan = kb.claim_task(conn, created.task_id, claimer="orchestrator")
+        assert plan is not None and plan.current_run_id is not None
         assert kb.complete_task(
             conn,
-            build.id,
-            summary="built before gateway crash",
+            plan.id,
+            summary="planned before gateway crash",
             metadata={
                 "durable_goal": {
+                    "workflow_version": 2,
                     "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
-                    "stage": "BUILD",
-                    "run_id": build.current_run_id,
-                    "candidate_sha": candidate_sha,
-                    "outcome": "BUILT",
+                    "stage": "PLAN",
+                    "run_id": plan.current_run_id,
+                    "decision": "PLAN_ACCEPTED",
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "orchestrator",
                 }
             },
-            expected_run_id=build.current_run_id,
+            expected_run_id=plan.current_run_id,
         )
 
     helper = Path(__file__).with_name("durable_goal_gateway_process.py")
@@ -178,37 +208,30 @@ def test_real_gateway_process_restart_reacquires_lock_lease_and_dedupes_successo
             assert [
                 binding.stage
                 for binding in list_durable_goal_tasks(conn, created.goal_id)
-            ] == ["BUILD"]
+            ] == ["PLAN"]
     finally:
-        old.kill()
-        old.wait(timeout=5)
+        if old.poll() is None:
+            old.kill()
+            old.wait(timeout=5)
 
-    restarted, restarted_payload = _run_gateway_harness(
-        kanban_home, "watch-once"
-    )
+    restarted, restarted_payload = _run_gateway_harness(kanban_home, "watch-once")
     assert restarted.returncode == 0, restarted.stderr
-    assert restarted_payload["runtime_id"].startswith(
-        f"{restarted_payload['pid']}:"
-    )
+    assert restarted_payload["runtime_id"].startswith(f"{restarted_payload['pid']}:")
     with kb.connect() as conn:
         stages = [
-            binding.stage
-            for binding in list_durable_goal_tasks(conn, created.goal_id)
+            binding.stage for binding in list_durable_goal_tasks(conn, created.goal_id)
         ]
         runtime = kb.get_durable_goal_runtime_row(conn)
         assert runtime is not None
         first_runtime_id = runtime["runtime_id"]
-    assert stages == ["BUILD", "VERIFY"]
+    assert stages == ["PLAN", "BUILD_CANDIDATE"]
 
-    replayed, replayed_payload = _run_gateway_harness(
-        kanban_home, "watch-once"
-    )
+    replayed, replayed_payload = _run_gateway_harness(kanban_home, "watch-once")
     assert replayed.returncode == 0, replayed.stderr
     assert replayed_payload["runtime_id"].startswith(f"{replayed_payload['pid']}:")
     assert replayed_payload["runtime_id"] != first_runtime_id
     with kb.connect() as conn:
         stages = [
-            binding.stage
-            for binding in list_durable_goal_tasks(conn, created.goal_id)
+            binding.stage for binding in list_durable_goal_tasks(conn, created.goal_id)
         ]
-    assert stages == ["BUILD", "VERIFY"]
+    assert stages == ["PLAN", "BUILD_CANDIDATE"]
