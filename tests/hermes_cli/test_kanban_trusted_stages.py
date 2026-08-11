@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import json
 from pathlib import Path
 import sqlite3
 from typing import cast
@@ -67,7 +68,7 @@ def _complete_bound_task(
 ):
     task = (
         kb.claim_review_task(conn, task_id, claimer=profile, allow_durable=True)
-        if stage == "REVIEW"
+        if stage == "REVIEW" or stage.startswith("REVIEW_RETRY_")
         else kb.claim_task(conn, task_id, claimer=profile)
     )
     assert task is not None and task.current_run_id is not None
@@ -1072,12 +1073,345 @@ def test_adjudicate_ready_requires_pass_approved_current_candidate_without_major
             board="default",
             runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
         )
+        replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert result.action == "READY_FOR_OWNER"
+    assert replay.action == "NOOP"
+    assert goal is not None and goal.status == "READY_FOR_OWNER"
+    assert [notification.kind for notification in notifications] == ["READY_FOR_OWNER"]
+
+
+def test_adjudicate_ready_after_exact_review_retry_keeps_build_evidence_attempt(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    contract = TaskContract.create(
+        reference="issue:ready-after-review-retry",
+        objective="Keep promotion evidence bound to its build attempt",
+        base_revision="8" * 40,
+        scope=("hermes_cli/",),
+        gates=("focused-tests",),
+    )
+    candidate_sha = "9" * 40
+
+    with kb.connect() as conn:
+        created, review_id = _create_goal_at_review(
+            conn, contract=contract, candidate_sha=candidate_sha
+        )
+        review = kb.claim_review_task(
+            conn, review_id, claimer="reviewer", allow_durable=True
+        )
+        assert review is not None and review.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            review.id,
+            summary="prose-only review requires retry",
+            metadata={"_kanban_dispatch_role": "reviewer"},
+            expected_run_id=review.current_run_id,
+        )
+        retry_id = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        ).task_id
+        assert retry_id is not None
+        _complete_bound_task(
+            conn,
+            task_id=retry_id,
+            profile="reviewer",
+            contract=contract,
+            stage="REVIEW_RETRY_1",
+            fields={
+                "candidate_sha": candidate_sha,
+                "verdict": "APPROVE",
+                "findings": [{"severity": "MINOR", "summary": "approved"}],
+                "reviewer_skill_digest": "f" * 64,
+            },
+        )
+        final_adjudicate_id = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        ).task_id
+        assert final_adjudicate_id is not None
+        _complete_bound_task(
+            conn,
+            task_id=final_adjudicate_id,
+            profile="orchestrator",
+            contract=contract,
+            stage="ADJUDICATE",
+            fields={
+                "candidate_sha": candidate_sha,
+                "decision": "READY_FOR_OWNER",
+            },
+        )
+
+        result = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
         goal = get_durable_goal(conn, created.goal_id)
         notifications = list_goal_notifications(conn, created.goal_id)
 
     assert result.action == "READY_FOR_OWNER"
     assert goal is not None and goal.status == "READY_FOR_OWNER"
     assert [notification.kind for notification in notifications] == ["READY_FOR_OWNER"]
+
+
+@pytest.mark.parametrize(
+    ("tampered_field", "tampered_value"),
+    [
+        ("evidence_hash", "0" * 64),
+        ("adapter_id", "forged-adapter"),
+        ("base_revision", "4" * 40),
+        ("scope", ["tests/"]),
+        ("gates", ["forged-gate"]),
+        ("attempt", False),
+    ],
+    ids=(
+        "self-hash",
+        "adapter",
+        "base",
+        "scope",
+        "gates",
+        "canonical-attempt-type",
+    ),
+)
+def test_adjudicate_blocks_post_persistence_promotion_tampering_once(
+    tmp_path, monkeypatch, tampered_field, tampered_value
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    contract = TaskContract.create(
+        reference="issue:tampered-promotion-adapter",
+        objective="Block persisted promotion evidence tampering",
+        base_revision="2" * 40,
+        scope=("hermes_cli/",),
+        gates=("focused-tests",),
+    )
+    candidate_sha = "3" * 40
+
+    with kb.connect() as conn:
+        created, review_id = _create_goal_at_review(
+            conn, contract=contract, candidate_sha=candidate_sha
+        )
+        _complete_bound_task(
+            conn,
+            task_id=review_id,
+            profile="reviewer",
+            contract=contract,
+            stage="REVIEW",
+            fields={
+                "candidate_sha": candidate_sha,
+                "verdict": "APPROVE",
+                "findings": [{"severity": "MINOR", "summary": "ok"}],
+                "reviewer_skill_digest": "f" * 64,
+            },
+        )
+        adjudicate_id = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        ).task_id
+        assert adjudicate_id is not None
+        row = conn.execute(
+            "SELECT promotion_evidence FROM kanban_goals WHERE id = ?",
+            (created.goal_id,),
+        ).fetchone()
+        tampered = json.loads(row["promotion_evidence"])
+        tampered[tampered_field] = tampered_value
+        conn.execute(
+            "UPDATE kanban_goals SET promotion_evidence = ? WHERE id = ?",
+            (json.dumps(tampered, sort_keys=True), created.goal_id),
+        )
+        _complete_bound_task(
+            conn,
+            task_id=adjudicate_id,
+            profile="orchestrator",
+            contract=contract,
+            stage="ADJUDICATE",
+            fields={
+                "candidate_sha": candidate_sha,
+                "decision": "READY_FOR_OWNER",
+            },
+        )
+
+        first = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert first.action == "BLOCKED"
+    assert first.reason == "invalid_promotion_evidence"
+    assert replay.action == "NOOP"
+    assert goal is not None and goal.status == "BLOCKED"
+    assert [notification.kind for notification in notifications] == ["HUMAN_GATE"]
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    (
+        "verdict",
+        "remove-major",
+        "candidate",
+        "foreign-run-event",
+        "run-profile",
+        "task-assignee",
+    ),
+)
+def test_adjudicate_blocks_post_persistence_review_tampering_once(
+    tmp_path, monkeypatch, tamper_kind
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    contract = TaskContract.create(
+        reference="issue:tampered-review-verdict",
+        objective="Bind readiness to authoritative review evidence",
+        base_revision="5" * 40,
+        scope=("hermes_cli/",),
+        gates=("focused-tests",),
+    )
+    candidate_sha = "6" * 40
+    review_fields = {
+        "candidate_sha": candidate_sha,
+        "verdict": "APPROVE",
+        "findings": [{"severity": "MINOR", "summary": "follow-up"}],
+        "reviewer_skill_digest": "f" * 64,
+    }
+    if tamper_kind == "verdict":
+        review_fields["verdict"] = "CHANGES_REQUIRED"
+    elif tamper_kind == "remove-major":
+        review_fields["findings"] = [
+            {"severity": "MAJOR", "summary": "must remain blocking"}
+        ]
+
+    with kb.connect() as conn:
+        created, review_id = _create_goal_at_review(
+            conn, contract=contract, candidate_sha=candidate_sha
+        )
+        review_task = _complete_bound_task(
+            conn,
+            task_id=review_id,
+            profile="reviewer",
+            contract=contract,
+            stage="REVIEW",
+            fields=review_fields,
+        )
+        adjudicate_id = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        ).task_id
+        assert adjudicate_id is not None
+        if tamper_kind in {"verdict", "remove-major", "candidate"}:
+            row = conn.execute(
+                "SELECT completion_payload FROM kanban_goal_tasks "
+                "WHERE goal_id = ? AND task_id = ?",
+                (created.goal_id, review_id),
+            ).fetchone()
+            tampered = json.loads(row["completion_payload"])
+            if tamper_kind == "verdict":
+                tampered["verdict"] = "APPROVE"
+            elif tamper_kind == "remove-major":
+                tampered["findings"] = []
+            else:
+                tampered["candidate_sha"] = "7" * 40
+            conn.execute(
+                "UPDATE kanban_goal_tasks SET completion_payload = ? "
+                "WHERE goal_id = ? AND task_id = ?",
+                (json.dumps(tampered, sort_keys=True), created.goal_id, review_id),
+            )
+        elif tamper_kind == "foreign-run-event":
+            plan_binding = next(
+                item
+                for item in list_durable_goal_tasks(conn, created.goal_id)
+                if item.stage == "PLAN"
+            )
+            conn.execute(
+                "UPDATE kanban_goal_tasks SET expected_run_id = ?, "
+                "completion_event_id = ? WHERE goal_id = ? AND task_id = ?",
+                (
+                    plan_binding.expected_run_id,
+                    plan_binding.completion_event_id,
+                    created.goal_id,
+                    review_id,
+                ),
+            )
+        elif tamper_kind == "run-profile":
+            conn.execute(
+                "UPDATE task_runs SET profile = 'forged-reviewer' WHERE id = ?",
+                (review_task.current_run_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET assignee = 'forged-reviewer' WHERE id = ?",
+                (review_id,),
+            )
+        _complete_bound_task(
+            conn,
+            task_id=adjudicate_id,
+            profile="orchestrator",
+            contract=contract,
+            stage="ADJUDICATE",
+            fields={
+                "candidate_sha": candidate_sha,
+                "decision": "READY_FOR_OWNER",
+            },
+        )
+
+        first = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        replay = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+        notifications = list_goal_notifications(conn, created.goal_id)
+
+    assert first.action == "BLOCKED"
+    assert first.reason == "invalid_review_evidence"
+    assert replay.action == "NOOP"
+    assert goal is not None and goal.status == "BLOCKED"
+    assert [notification.kind for notification in notifications] == ["HUMAN_GATE"]
 
 
 def test_adjudicate_ready_rejects_major_finding_without_terminalizing(

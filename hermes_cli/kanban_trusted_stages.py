@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Mapping, Protocol
+from typing import Any, Mapping, Protocol
 
 
 class Authority(str, Enum):
@@ -293,6 +293,56 @@ class PromotionEvidence:
             "scope": list(self.scope),
             "summary": self.summary,
         }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "PromotionEvidence":
+        expected_keys = {
+            "adapter_id",
+            "attempt",
+            "base_revision",
+            "candidate_sha",
+            "classification",
+            "contract_hash",
+            "evidence_hash",
+            "gates",
+            "scope",
+            "summary",
+        }
+        if set(payload) != expected_keys:
+            raise ValueError("promotion evidence payload is not canonical")
+        string_fields: dict[str, str] = {}
+        for key in expected_keys - {"attempt", "gates", "scope"}:
+            value = payload[key]
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(f"promotion evidence {key} is not canonical")
+            string_fields[key] = value
+        attempt = payload["attempt"]
+        if type(attempt) is not int or attempt < 0:
+            raise ValueError("promotion evidence attempt is not canonical")
+        scope = payload["scope"]
+        gates = payload["gates"]
+        if (
+            not isinstance(scope, list)
+            or not isinstance(gates, list)
+            or any(not isinstance(item, str) for item in scope)
+            or any(not isinstance(item, str) for item in gates)
+        ):
+            raise ValueError("promotion evidence scope or gates are not canonical")
+        evidence = cls(
+            adapter_id=string_fields["adapter_id"],
+            contract_hash=string_fields["contract_hash"],
+            base_revision=string_fields["base_revision"],
+            scope=tuple(scope),
+            gates=tuple(gates),
+            candidate_sha=string_fields["candidate_sha"],
+            attempt=attempt,
+            classification=ResultClassification(string_fields["classification"]),
+            summary=string_fields["summary"],
+            evidence_hash=string_fields["evidence_hash"],
+        )
+        if not evidence.verify_hash():
+            raise ValueError("promotion evidence hash does not match its payload")
+        return evidence
 
     def verify_hash(self) -> bool:
         rebuilt = type(self).create(

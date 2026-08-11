@@ -381,6 +381,21 @@ def list_goal_notifications(conn, goal_id: str) -> list[GoalNotification]:
     return notifications
 
 
+def _latest_completed_build_binding(conn, goal_id: str) -> Optional[DurableGoalTask]:
+    source_rows = [
+        binding
+        for binding in list_durable_goal_tasks(conn, goal_id)
+        if binding.completion_event_id is not None
+        and (
+            binding.stage == "BUILD_CANDIDATE"
+            or binding.stage.startswith("REPAIR_BUILD_")
+        )
+    ]
+    return (
+        max(source_rows, key=lambda binding: binding.attempt) if source_rows else None
+    )
+
+
 def apply_trusted_stage_result(
     conn,
     goal_id: str,
@@ -409,18 +424,9 @@ def apply_trusted_stage_result(
         or evidence.candidate_sha != goal.candidate_sha
     ):
         return SupervisionResult("NOOP", goal_id, reason="trusted_evidence_mismatch")
-    source_rows = [
-        binding
-        for binding in list_durable_goal_tasks(conn, goal.id)
-        if binding.completion_event_id is not None
-        and (
-            binding.stage == "BUILD_CANDIDATE"
-            or binding.stage.startswith("REPAIR_BUILD_")
-        )
-    ]
-    if not source_rows:
+    source = _latest_completed_build_binding(conn, goal.id)
+    if source is None:
         return SupervisionResult("NOOP", goal_id, reason="missing_build_source")
-    source = max(source_rows, key=lambda binding: binding.attempt)
     if evidence.attempt != source.attempt:
         return SupervisionResult("NOOP", goal_id, reason="stale_trusted_evidence")
     if evidence.classification == ResultClassification.PASS:
@@ -787,20 +793,80 @@ def _validate_review_payload(
     return normalized
 
 
-def _latest_completed_review_payload(
+def _validated_current_review_payload(
     conn,
     *,
-    goal_id: str,
-    attempt: int,
+    goal: DurableGoal,
+    adjudicate_binding: DurableGoalTask,
 ) -> Optional[dict[str, Any]]:
-    row = conn.execute(
-        "SELECT completion_payload FROM kanban_goal_tasks "
+    rows = conn.execute(
+        "SELECT * FROM kanban_goal_tasks "
         "WHERE goal_id = ? AND (stage = 'REVIEW' OR stage LIKE 'REVIEW_RETRY_%') "
         "AND attempt = ? "
-        "AND completion_event_id IS NOT NULL",
-        (goal_id, int(attempt)),
-    ).fetchone()
-    return _decode_object(row["completion_payload"]) if row is not None else None
+        "AND completion_event_id IS NOT NULL ORDER BY created_at DESC",
+        (goal.id, adjudicate_binding.attempt),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    review_binding = _task_from_row(rows[0])
+    if (
+        review_binding.expected_run_id is None
+        or review_binding.completion_event_id is None
+        or review_binding.expected_candidate_sha != str(goal.candidate_sha or "")
+        or adjudicate_binding.expected_candidate_sha != str(goal.candidate_sha or "")
+    ):
+        return None
+    event = _validated_terminal_event(conn, review_binding)
+    if (
+        event is None
+        or int(event["id"]) != review_binding.completion_event_id
+        or str(event["kind"] or "") != "completed"
+        or str(event["task_id"] or "") != review_binding.task_id
+        or int(event["run_id"]) != review_binding.expected_run_id
+    ):
+        return None
+    authoritative = _structured_v2_authority_payload(
+        conn,
+        goal,
+        review_binding,
+        event,
+        expected_stage=review_binding.stage,
+        expected_authority=Authority.REVIEWER.value,
+        expected_profile=goal.reviewer_profile,
+    )
+    authoritative = _validate_review_payload(authoritative, goal)
+    if authoritative is None or review_binding.completion_payload != authoritative:
+        return None
+    return authoritative
+
+
+def _validated_current_promotion_evidence(
+    conn,
+    goal: DurableGoal,
+    binding: DurableGoalTask,
+) -> Optional[PromotionEvidence]:
+    contract = goal.task_contract
+    if contract is None or not isinstance(goal.promotion_evidence, Mapping):
+        return None
+    try:
+        evidence = PromotionEvidence.from_payload(goal.promotion_evidence)
+    except (TypeError, ValueError):
+        return None
+    source = _latest_completed_build_binding(conn, goal.id)
+    if (
+        source is None
+        or evidence.classification != ResultClassification.PASS
+        or evidence.adapter_id != str(goal.verify_promote_adapter_id or "")
+        or evidence.contract_hash != contract.contract_hash
+        or evidence.base_revision != contract.base_revision
+        or evidence.scope != contract.scope
+        or evidence.gates != contract.gates
+        or evidence.candidate_sha != str(goal.candidate_sha or "")
+        or binding.expected_candidate_sha != str(goal.candidate_sha or "")
+        or evidence.attempt != source.attempt
+    ):
+        return None
+    return evidence
 
 
 def _terminal_event_payload(
@@ -1082,21 +1148,33 @@ def _supervise_v2_goal_once(
                 reason="invalid_structured_adjudication",
                 notification_kind="UNRECOVERABLE_FAILURE",
             )
-        review_payload = _latest_completed_review_payload(
-            conn, goal_id=goal.id, attempt=binding.attempt
-        )
         if decision == AdjudicationDecision.READY_FOR_OWNER:
-            evidence = goal.promotion_evidence or {}
+            evidence = _validated_current_promotion_evidence(conn, goal, binding)
+            if evidence is None:
+                return _block_v2_goal_from_current_event(
+                    conn,
+                    goal,
+                    binding,
+                    event,
+                    reason="invalid_promotion_evidence",
+                    notification_kind="HUMAN_GATE",
+                )
+            review_payload = _validated_current_review_payload(
+                conn,
+                goal=goal,
+                adjudicate_binding=binding,
+            )
+            if review_payload is None:
+                return _block_v2_goal_from_current_event(
+                    conn,
+                    goal,
+                    binding,
+                    event,
+                    reason="invalid_review_evidence",
+                    notification_kind="HUMAN_GATE",
+                )
             if (
-                str(evidence.get("classification") or "")
-                != ResultClassification.PASS.value
-                or str(evidence.get("contract_hash") or "")
-                != goal.task_contract.contract_hash
-                or str(evidence.get("candidate_sha") or "") != candidate_sha
-                or int(evidence.get("attempt", -1)) != binding.attempt
-                or not isinstance(review_payload, dict)
-                or str(review_payload.get("verdict") or "")
-                != ReviewVerdict.APPROVE.value
+                str(review_payload.get("verdict") or "") != ReviewVerdict.APPROVE.value
                 or str(review_payload.get("candidate_sha") or "") != candidate_sha
                 or _payload_has_blocking_findings(review_payload)
                 or bool(payload.get("human_gate"))
