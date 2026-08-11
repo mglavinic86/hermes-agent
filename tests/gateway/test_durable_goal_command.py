@@ -21,6 +21,14 @@ from hermes_cli.kanban_goal_supervisor import (
     create_durable_goal,
     get_durable_goal,
 )
+from hermes_cli.kanban_trusted_stages import (
+    PromotionEvidence,
+    PromotionRequest,
+    ResultClassification,
+    StaticTaskContractResolver,
+    TaskContract,
+    TrustedStageRegistry,
+)
 
 PINNED_REVIEWER_DIGEST = (
     "1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1"
@@ -40,6 +48,270 @@ class _SessionStore:
 
 
 @pytest.mark.asyncio
+async def test_goal_durable_contract_resolves_static_v2_contract_without_adapter_execution(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+kanban:
+  durable_goals:
+    workflow_version: 2
+    start_mode: trusted_contract
+    orchestrator_profile: orchestrator
+    builder_profile: builder
+    reviewer_profile: reviewer
+    task_contract_resolver: fixture-resolver
+    verify_promote_adapter: fixture-adapter
+    reviewer_skill_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    repair_budget: 1
+    review_retry_budget: 1
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kb.connect() as conn:
+        kb.upsert_durable_goal_runtime(
+            conn,
+            runtime_id="compatible-v2-singleton",
+            schema_version=DURABLE_GOAL_SCHEMA_VERSION,
+            protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+            lease_seconds=300,
+        )
+    contract = TaskContract.create(
+        reference="issue:gateway-fixture",
+        objective="Create a trusted PLAN task",
+        base_revision="b" * 40,
+        scope=("hermes_cli/", "gateway/"),
+        gates=("focused-tests",),
+    )
+    resolver = StaticTaskContractResolver(
+        resolver_id="fixture-resolver",
+        contracts={contract.reference: contract},
+    )
+
+    class FakeAdapter:
+        adapter_id = "fixture-adapter"
+
+        def __init__(self):
+            self.calls = 0
+
+        def classify(self, _request):
+            self.calls += 1
+            raise AssertionError("PR 223-A must not execute adapters")
+
+    adapter = FakeAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _SessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+    runner._active_profile_name = lambda: "gateway-owner"
+    runner._trusted_stage_registry = TrustedStageRegistry(
+        resolvers={resolver.resolver_id: resolver},
+        adapters={adapter.adapter_id: adapter},
+    )
+
+    response = await GatewayRunner._handle_goal_command(
+        runner,
+        MessageEvent(
+            text="/goal durable contract issue:gateway-fixture",
+            message_type=MessageType.COMMAND,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="owner-chat",
+                chat_type="dm",
+                user_id="owner-7",
+                profile="gateway-owner",
+            ),
+            message_id="trusted-contract-origin",
+        ),
+    )
+
+    assert "Durable goal created" in response
+    goal_id = response.split()[3]
+    with kb.connect() as conn:
+        goal = get_durable_goal(conn, goal_id)
+        rows = conn.execute(
+            "SELECT stage FROM kanban_goal_tasks WHERE goal_id = ?", (goal_id,)
+        ).fetchall()
+    assert goal is not None and goal.task_contract == contract
+    assert goal.current_stage == "PLAN"
+    assert [row["stage"] for row in rows] == ["PLAN"]
+    assert adapter.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_goal_durable_v2_free_form_fails_closed_with_zero_rows(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+kanban:
+  durable_goals:
+    workflow_version: 2
+    start_mode: trusted_contract
+    orchestrator_profile: orchestrator
+    builder_profile: builder
+    reviewer_profile: reviewer
+    task_contract_resolver: fixture-resolver
+    verify_promote_adapter: fixture-adapter
+    reviewer_skill_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _SessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+    runner._active_profile_name = lambda: "gateway-owner"
+
+    response = await GatewayRunner._handle_goal_command(
+        runner,
+        MessageEvent(
+            text="/goal durable this free-form objective is not a contract",
+            message_type=MessageType.COMMAND,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="owner-chat",
+                chat_type="dm",
+                profile="gateway-owner",
+            ),
+            message_id="free-form-must-not-persist",
+        ),
+    )
+
+    with kb.connect() as conn:
+        table_names = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "kanban_goals",
+                "tasks",
+                "kanban_goal_tasks",
+                "kanban_goal_notification_outbox",
+            )
+        }
+        counts["kanban_goal_operations"] = (
+            conn.execute("SELECT COUNT(*) FROM kanban_goal_operations").fetchone()[0]
+            if "kanban_goal_operations" in table_names
+            else 0
+        )
+    assert response == "Usage: /goal durable contract <opaque-ref>"
+    assert counts == {
+        "kanban_goals": 0,
+        "tasks": 0,
+        "kanban_goal_tasks": 0,
+        "kanban_goal_notification_outbox": 0,
+        "kanban_goal_operations": 0,
+    }
+    assert runner._queued_events == {}
+
+
+@pytest.mark.asyncio
+async def test_goal_durable_v1_start_is_retired_without_creating_rows(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+kanban:
+  durable_goals:
+    workflow_version: 1
+    builder_profile: legacy-builder
+    verifier_profile: legacy-verifier
+    reviewer_profile: legacy-reviewer
+    reviewer_skill_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _SessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+    runner._active_profile_name = lambda: "gateway-owner"
+
+    response = await GatewayRunner._handle_goal_command(
+        runner,
+        MessageEvent(
+            text="/goal durable legacy active start",
+            message_type=MessageType.COMMAND,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="owner-chat",
+                chat_type="dm",
+                profile="gateway-owner",
+            ),
+            message_id="retired-v1-start",
+        ),
+    )
+
+    with kb.connect() as conn:
+        counts = tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("kanban_goals", "kanban_goal_tasks", "tasks")
+        )
+    assert "Workflow V1 is retired" in response
+    assert counts == (0, 0, 0)
+
+
+class _FakeVerifyPromoteAdapter:
+    adapter_id = "fixture-adapter"
+
+    def classify(self, request: PromotionRequest) -> PromotionEvidence:
+        return PromotionEvidence.create(
+            adapter_id=self.adapter_id,
+            request=request,
+            classification=ResultClassification.PASS,
+            summary="fixture pass",
+        )
+
+
+def _trusted_registry(reference: str = "fixture-contract") -> TrustedStageRegistry:
+    contract = TaskContract.create(
+        reference=reference,
+        objective="Ship the candidate without merging",
+        base_revision="a" * 40,
+        scope=("hermes_cli/", "tests/"),
+        gates=("focused-tests",),
+    )
+    resolver = StaticTaskContractResolver(
+        resolver_id="fixture-resolver",
+        contracts={contract.reference: contract},
+    )
+    adapter = _FakeVerifyPromoteAdapter()
+    return TrustedStageRegistry(
+        resolvers={resolver.resolver_id: resolver},
+        adapters={adapter.adapter_id: adapter},
+    )
+
+
+@pytest.mark.asyncio
 async def test_goal_durable_creates_kanban_goal_without_agent_kickoff(
     tmp_path, monkeypatch
 ):
@@ -49,9 +321,13 @@ async def test_goal_durable_creates_kanban_goal_without_agent_kickoff(
         """
 kanban:
   durable_goals:
-    builder_profile: turpi_builder
-    verifier_profile: turpi_verify
-    reviewer_profile: turpi_review
+    workflow_version: 2
+    start_mode: trusted_contract
+    task_contract_resolver: fixture-resolver
+    verify_promote_adapter: fixture-adapter
+    orchestrator_profile: orchestrator
+    builder_profile: builder
+    reviewer_profile: reviewer
     reviewer_skill_digest: 1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1
     repair_budget: 1
     review_retry_budget: 1
@@ -94,12 +370,13 @@ kanban:
     runner.adapters = {}
     runner._queued_events = {}
     runner._active_profile_name = lambda: "gateway-owner"
+    runner._trusted_stage_registry = _trusted_registry()
     runner._enqueue_fifo = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("durable goals must not enqueue a synthetic user turn")
     )
 
     event = MessageEvent(
-        text="/goal durable Ship the candidate without merging",
+        text="/goal durable contract fixture-contract",
         message_type=MessageType.COMMAND,
         source=SessionSource(
             platform=Platform.TELEGRAM,
@@ -120,9 +397,81 @@ kanban:
         goal = get_durable_goal(conn, goal_id)
     assert goal is not None
     assert goal.objective == "Ship the candidate without merging"
+    assert goal.workflow_version == 2
+    assert goal.current_stage == "PLAN"
     assert goal.origin.message_id == "origin-message-1"
     assert goal.reviewer_skill_digest == PINNED_REVIEWER_DIGEST
     assert runner._queued_events == {}
+
+
+@pytest.mark.asyncio
+async def test_goal_durable_free_form_fails_closed_in_trusted_v2_mode(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+kanban:
+  durable_goals:
+    workflow_version: 2
+    start_mode: trusted_contract
+    task_contract_resolver: fixture-resolver
+    verify_promote_adapter: fixture-adapter
+    orchestrator_profile: orchestrator
+    builder_profile: builder
+    reviewer_profile: reviewer
+    reviewer_skill_digest: 1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kb.connect() as conn:
+        kb.upsert_durable_goal_runtime(
+            conn,
+            runtime_id="compatible-singleton",
+            schema_version=DURABLE_GOAL_SCHEMA_VERSION,
+            protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+            lease_seconds=300,
+        )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _SessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+    runner._active_profile_name = lambda: "gateway-owner"
+    runner._trusted_stage_registry = _trusted_registry()
+
+    response = await GatewayRunner._handle_goal_command(
+        runner,
+        MessageEvent(
+            text="/goal durable Ship free form",
+            message_type=MessageType.COMMAND,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="owner-chat",
+                chat_type="dm",
+                profile="gateway-owner",
+            ),
+            message_id="origin-free-form",
+        ),
+    )
+
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM kanban_goals").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM kanban_goal_notification_outbox"
+            ).fetchone()[0]
+            == 0
+        )
+    assert response == "Usage: /goal durable contract <opaque-ref>"
 
 
 @pytest.mark.asyncio
@@ -135,9 +484,13 @@ async def test_goal_durable_create_internal_error_is_logged_without_chat_leak(
         """
 kanban:
   durable_goals:
-    builder_profile: turpi_builder
-    verifier_profile: turpi_verify
-    reviewer_profile: turpi_review
+    workflow_version: 2
+    start_mode: trusted_contract
+    task_contract_resolver: fixture-resolver
+    verify_promote_adapter: fixture-adapter
+    orchestrator_profile: orchestrator
+    builder_profile: builder
+    reviewer_profile: reviewer
     reviewer_skill_digest: 1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1
 """.lstrip(),
         encoding="utf-8",
@@ -169,7 +522,7 @@ kanban:
 
     monkeypatch.setattr(
         kanban_goal_supervisor,
-        "create_durable_goal",
+        "create_trusted_durable_goal",
         _raise_sensitive_os_error,
     )
 
@@ -181,8 +534,9 @@ kanban:
     runner.adapters = {}
     runner._queued_events = {}
     runner._active_profile_name = lambda: "gateway-owner"
+    runner._trusted_stage_registry = _trusted_registry()
     event = MessageEvent(
-        text="/goal durable Do not expose internal failures",
+        text="/goal durable contract fixture-contract",
         message_type=MessageType.COMMAND,
         source=SessionSource(
             platform=Platform.TELEGRAM,
@@ -221,9 +575,13 @@ async def test_goal_durable_requires_pinned_reviewer_skill_digest(
         f"""
 kanban:
   durable_goals:
-    builder_profile: turpi_builder
-    verifier_profile: turpi_verify
-    reviewer_profile: turpi_review
+    workflow_version: 2
+    start_mode: trusted_contract
+    task_contract_resolver: fixture-resolver
+    verify_promote_adapter: fixture-adapter
+    orchestrator_profile: orchestrator
+    builder_profile: builder
+    reviewer_profile: reviewer
 {digest_line}""".lstrip(),
         encoding="utf-8",
     )
@@ -251,11 +609,12 @@ kanban:
     runner.adapters = {}
     runner._queued_events = {}
     runner._active_profile_name = lambda: "gateway-owner"
+    runner._trusted_stage_registry = _trusted_registry()
 
     response = await GatewayRunner._handle_goal_command(
         runner,
         MessageEvent(
-            text="/goal durable Missing pinned reviewer digest",
+            text="/goal durable contract fixture-contract",
             message_type=MessageType.COMMAND,
             source=SessionSource(
                 platform=Platform.TELEGRAM,
@@ -274,16 +633,21 @@ kanban:
 
 
 @pytest.mark.asyncio
-async def test_goal_durable_requires_explicit_board_workdir(tmp_path, monkeypatch):
+async def test_goal_durable_v2_rejects_legacy_verifier_profile(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
         """
 kanban:
   durable_goals:
-    builder_profile: turpi_builder
-    verifier_profile: turpi_verify
-    reviewer_profile: turpi_review
+    workflow_version: 2
+    start_mode: trusted_contract
+    task_contract_resolver: fixture-resolver
+    verify_promote_adapter: fixture-adapter
+    orchestrator_profile: orchestrator
+    builder_profile: builder
+    verifier_profile: verifier
+    reviewer_profile: reviewer
     reviewer_skill_digest: 1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1
 """.lstrip(),
         encoding="utf-8",
@@ -307,11 +671,12 @@ kanban:
     runner.adapters = {}
     runner._queued_events = {}
     runner._active_profile_name = lambda: "gateway-owner"
+    runner._trusted_stage_registry = _trusted_registry()
 
     response = await GatewayRunner._handle_goal_command(
         runner,
         MessageEvent(
-            text="/goal durable Must have a known checkout",
+            text="/goal durable contract fixture-contract",
             message_type=MessageType.COMMAND,
             source=SessionSource(
                 platform=Platform.TELEGRAM,
@@ -319,18 +684,20 @@ kanban:
                 chat_type="dm",
                 profile="gateway-owner",
             ),
-            message_id="origin-no-workdir",
+            message_id="origin-legacy-verifier",
         ),
     )
 
     with kb.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM kanban_goals").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
-    assert "board default_workdir" in response
+    assert "verifier_profile is not valid for Workflow V2" in response
 
 
 @pytest.mark.asyncio
-async def test_goal_durable_complete_is_origin_and_candidate_bound(tmp_path, monkeypatch):
+async def test_goal_durable_complete_is_origin_and_candidate_bound(
+    tmp_path, monkeypatch
+):
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
@@ -410,9 +777,13 @@ async def test_goal_durable_refuses_incompatible_singleton_without_creating_task
         """
 kanban:
   durable_goals:
-    builder_profile: turpi_builder
-    verifier_profile: turpi_verify
-    reviewer_profile: turpi_review
+    workflow_version: 2
+    start_mode: trusted_contract
+    task_contract_resolver: fixture-resolver
+    verify_promote_adapter: fixture-adapter
+    orchestrator_profile: orchestrator
+    builder_profile: builder
+    reviewer_profile: reviewer
     reviewer_skill_digest: 1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1
 """.lstrip(),
         encoding="utf-8",
@@ -438,11 +809,12 @@ kanban:
     runner.adapters = {}
     runner._queued_events = {}
     runner._active_profile_name = lambda: "gateway-owner"
+    runner._trusted_stage_registry = _trusted_registry()
 
     response = await GatewayRunner._handle_goal_command(
         runner,
         MessageEvent(
-            text="/goal durable Must not dispatch under skew",
+            text="/goal durable contract fixture-contract",
             message_type=MessageType.COMMAND,
             source=SessionSource(
                 platform=Platform.TELEGRAM,

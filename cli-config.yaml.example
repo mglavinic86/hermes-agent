@@ -200,18 +200,23 @@ model:
 # =============================================================================
 # Durable Kanban Goal Supervisor (explicit opt-in)
 # =============================================================================
-# `/goal durable <objective>` remains unavailable until every lock-eligible
-# gateway runs the matching supervisor protocol and the active dispatcher has
-# written a fresh compatibility lease. The board must have an absolute Git
-# `default_workdir`. Reviewer skills are profile-local snapshots: do not use
-# symlinks or live inheritance from another profile.
+# `/goal durable contract <opaque-ref>` remains unavailable until every
+# lock-eligible gateway runs the matching supervisor protocol and the active
+# dispatcher has written a fresh compatibility lease. Workflow V2 has exactly
+# three LLM authorities: orchestrator, builder, and reviewer. The trusted
+# contract resolver and verify/promote adapter names are static registry ids
+# supplied by the gateway runtime; they are not import paths or commands.
 #
 # kanban:
 #   durable_goals:
-#     board: turpi-v2
-#     builder_profile: turpi_builder
-#     verifier_profile: turpi_verify
-#     reviewer_profile: turpi_review
+#     workflow_version: 2
+#     start_mode: trusted_contract
+#     board: default
+#     task_contract_resolver: local-contract-registry
+#     verify_promote_adapter: local-verify-promote
+#     orchestrator_profile: durable_orchestrator
+#     builder_profile: durable_builder
+#     reviewer_profile: durable_reviewer
 #     reviewer_skill_digest: "1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1"
 #     repair_budget: 1
 #     review_retry_budget: 1

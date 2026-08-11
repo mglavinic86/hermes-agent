@@ -1,91 +1,82 @@
 # Durable Kanban Goals
 
-Durable Kanban goals are an explicit gateway-only opt-in:
+Durable Kanban goals are an explicit gateway-only opt-in for trusted Workflow
+V2 contracts:
 
 ```text
-/goal durable <objective>
+/goal durable contract <opaque-ref>
 ```
 
-Legacy `/goal <text>` behavior is unchanged. The durable form records the
-gateway origin, creates one Kanban BUILD task, and relies on the gateway Kanban
-watcher to advance a deterministic supervisor state machine. It does not enqueue
-a synthetic chat turn.
+Legacy `/goal <text>` behavior is unchanged. `/goal durable complete <goal-id>
+<candidate-sha>` is also preserved and only records owner completion; it does
+not merge, push, deploy, or run an operation executor.
 
-Required configuration:
+Free-form `/goal durable <objective>` is not a trusted V2 entrypoint. In
+trusted-contract mode it fails closed before creating any goal, task, or outbox
+row.
+
+## Configuration
 
 ```yaml
 kanban:
   durable_goals:
-    board: turpi-v2
-    builder_profile: turpi_builder
-    verifier_profile: turpi_verify
-    reviewer_profile: turpi_review
+    workflow_version: 2
+    start_mode: trusted_contract
+    board: default
+    task_contract_resolver: local-contract-registry
+    verify_promote_adapter: local-verify-promote
+    orchestrator_profile: durable_orchestrator
+    builder_profile: durable_builder
+    reviewer_profile: durable_reviewer
     reviewer_skill_digest: 1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1
     repair_budget: 1
     review_retry_budget: 1
 ```
 
-The selected board must have an existing absolute Git checkout configured as
-its `default_workdir`. Each stage inherits the same resolved worktree/branch
-lineage. A route with no known gateway destination, no board checkout, invalid
-budget, or an incompatible dispatcher lease fails without creating a goal or
-worker task.
+`task_contract_resolver` and `verify_promote_adapter` are static registry ids
+supplied by the gateway runtime. They are not module paths, file paths, shell
+commands, URLs, or dynamic imports. Workflow V2 rejects `verifier_profile`: the
+only LLM authorities are `orchestrator`, `builder`, and `reviewer`.
 
-## State and authority
+The reviewer digest pins the reviewer profile's isolated
+`immutable-change-reviews` skill snapshot. Reviewer skills must be profile-local
+snapshots, not symlinks or live inheritance from another profile.
 
-The deterministic stages are `BUILD -> REPAIR_BUILD_n -> VERIFY -> REVIEW ->
-READY_FOR_OWNER`; repair is omitted when unnecessary and malformed reviews may
-use bounded `REVIEW_RETRY_n` stages. Attempt reservation and successor creation
-commit in the same CAS transaction, so a crash cannot refund an attempt or mint
-a duplicate successor. `BLOCKED_CAPABILITY`, `BLOCKED`, and `READY_FOR_OWNER`
-are durable database states.
+## Workflow V2
 
-Workers must complete with `metadata.durable_goal` structured payloads. The
-supervisor rejects prose verdicts, stale run ids, non-positive run ids, malformed
-payloads, candidate SHA mismatches, foreign boards, and protocol version skew.
-Review tasks additionally require reviewer dispatch-role provenance and the
-reviewer's isolated `immutable-change-reviews` skill snapshot matching the
-pinned `reviewer_skill_digest`. Capability preflight runs before claim/spawn;
-failure creates no run, preserves the prerequisite as a durable block, and
-enqueues one owner notification.
+Workflow V2 starts with a PLAN task assigned to the orchestrator. A successful
+PLAN creates `BUILD_CANDIDATE` for the builder. Builder completion enters the
+taskless `VERIFY_PROMOTE` boundary; the gateway supervisor does not dispatch a
+verifier task. A safe injected/fake boundary applies deterministic
+verify/promote evidence with one of these protocol classifications:
 
-`READY_FOR_OWNER` grants no Git or deployment authority. After separately
-performing or observing the owner action, the exact originating chat may record
-final completion for the exact candidate:
+- `PASS` creates `REVIEW` for the reviewer.
+- `RETRYABLE` leaves the same taskless `VERIFY_PROMOTE` state unchanged.
+- `REPAIRABLE_FAILURE` creates `ADJUDICATE` for the orchestrator; only `REPAIR`
+  or `HUMAN_GATE` can advance from that evidence.
+- `HARD_BLOCK` atomically terminalizes to a human gate without creating a
+  builder or reviewer task.
 
-```text
-/goal durable complete <goal-id> <candidate-sha>
-```
+Reviewer verdicts are `APPROVE`, `CHANGES_REQUIRED`, and `BLOCKED`. Finding
+severities are `BLOCKER`, `MAJOR`, `MINOR`, and `NIT`. Review completion always
+creates `ADJUDICATE`; it never makes a goal ready directly.
 
-This command only records `COMPLETED`; it does not merge, push, or deploy.
+Adjudication decisions are `READY_FOR_OWNER`, `REPAIR`, and `HUMAN_GATE`.
+`READY_FOR_OWNER` is accepted only for the current goal state when the current
+candidate, contract, run, PASS promotion evidence, and APPROVE review all match,
+there are no `BLOCKER` or `MAJOR` findings, and no human gate is requested.
+`REPAIR` is bounded by `repair_budget` and creates `REPAIR_BUILD_n` for the
+builder. `HUMAN_GATE` terminalizes safely and enqueues one logical owner
+notification.
 
-Terminal owner states are delivered through the durable goal notification
-outbox. Delivery is intentionally separate from state transition so restart or
-replay at successor creation and pre-delivery boundaries cannot create duplicate
-successors or outbox rows. Notifications are limited to blocking/major findings,
-unrecoverable or capability failures, `READY_FOR_OWNER`, and final completion.
-Outbox claims have a bounded lease; if a gateway crashes after reserving a row
-but before calling `adapter.send`, a restarted watcher can reclaim the expired
-row and send it once. If the adapter send succeeds and the process crashes
-before the durable ack, delivery is necessarily at-least-once unless that
-adapter provides its own idempotent send key.
-
-## Mixed-version rollout gate
+## Rollout And Migration
 
 Every gateway instance that can acquire the machine-wide Kanban dispatcher lock
-must be upgraded before `kanban.durable_goals` is enabled. Mixed lock-eligible
-gateway versions are intentionally fail-closed: private task states protect
-already-created supervised tasks from older dispatchers, while the runtime
-lease/config gate prevents new durable goal creation under a stale owner.
+must be upgraded before trusted V2 durable goals are enabled. Creation checks a
+fresh `kanban_goal_runtime` lease with the exact schema and protocol version
+before inserting anything.
 
-1. Deploy/start the upgraded singleton gateway dispatcher first.
-2. Wait for it to acquire the existing machine-wide dispatcher lock and write a
-   fresh `kanban_goal_runtime` lease with the exact schema and protocol version.
-3. Only then enable or use `/goal durable`.
-
-The public route checks the lease before inserting anything. Supervised tasks
-use private `durable_ready`/`durable_review` queue states, so an older dispatcher
-cannot claim them. The upgraded dispatcher independently checks board,
-protocol, goal state, current run, role, and required skill before every spawn;
-it does not infer compatibility from profile identity. Ordinary `/goal` and
-ordinary Kanban task states retain their existing behavior.
+The migration is additive. V1 terminal history remains readable. If an active
+V1 durable goal is observed by a V2 supervisor, it fails closed once to a human
+gate, enqueues one logical durable owner notification, and never spawns a V2
+verifier. Ordinary Kanban tasks are unaffected.

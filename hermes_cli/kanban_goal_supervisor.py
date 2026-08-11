@@ -16,12 +16,22 @@ from typing import Any, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
 from agent.skill_integrity import compute_skill_tree_digest
+from hermes_cli.kanban_trusted_stages import (
+    AdjudicationDecision,
+    Authority,
+    FindingSeverity,
+    PlanDecision,
+    PromotionEvidence,
+    ReviewVerdict,
+    ResultClassification,
+    TaskContract,
+)
 
 
-DURABLE_GOAL_SCHEMA_VERSION = 1
-DURABLE_GOAL_PROTOCOL_VERSION = 1
+DURABLE_GOAL_SCHEMA_VERSION = 2
+DURABLE_GOAL_PROTOCOL_VERSION = 2
+DURABLE_GOAL_WORKFLOW_VERSION = 2
 _CANDIDATE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_SKILL_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -54,8 +64,14 @@ class DurableGoal:
     objective: str
     status: str
     current_stage: str
+    workflow_version: int
     board: str
     origin: GoalOrigin
+    task_contract: Optional[TaskContract]
+    resolver_id: Optional[str]
+    orchestrator_profile: Optional[str]
+    verify_promote_adapter_id: Optional[str]
+    promotion_evidence: Optional[dict[str, Any]]
     builder_profile: str
     verifier_profile: str
     reviewer_profile: str
@@ -135,11 +151,22 @@ def _decode_object(raw: Any) -> Optional[dict[str, Any]]:
 
 
 def _goal_from_row(row) -> DurableGoal:
+    contract = None
+    if "task_contract_json" in row.keys() and row["task_contract_json"]:
+        try:
+            raw_contract = json.loads(str(row["task_contract_json"]))
+            if isinstance(raw_contract, dict):
+                contract = TaskContract.from_payload(raw_contract)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            contract = None
     return DurableGoal(
         id=str(row["id"]),
         objective=str(row["objective"]),
         status=str(row["status"]),
         current_stage=str(row["current_stage"]),
+        workflow_version=(
+            int(row["workflow_version"]) if "workflow_version" in row.keys() else 1
+        ),
         board=str(row["board_slug"]),
         origin=GoalOrigin(
             platform=str(row["origin_platform"]),
@@ -150,6 +177,29 @@ def _goal_from_row(row) -> DurableGoal:
             message_id=row["origin_message_id"],
             notifier_profile=row["notifier_profile"],
             delivery_metadata=_decode_object(row["delivery_metadata"]),
+        ),
+        task_contract=contract,
+        resolver_id=(
+            str(row["resolver_id"])
+            if "resolver_id" in row.keys() and row["resolver_id"] is not None
+            else None
+        ),
+        orchestrator_profile=(
+            str(row["orchestrator_profile"])
+            if "orchestrator_profile" in row.keys()
+            and row["orchestrator_profile"] is not None
+            else None
+        ),
+        verify_promote_adapter_id=(
+            str(row["verify_promote_adapter_id"])
+            if "verify_promote_adapter_id" in row.keys()
+            and row["verify_promote_adapter_id"] is not None
+            else None
+        ),
+        promotion_evidence=(
+            _decode_object(row["promotion_evidence"])
+            if "promotion_evidence" in row.keys()
+            else None
         ),
         builder_profile=str(row["builder_profile"]),
         verifier_profile=str(row["verifier_profile"]),
@@ -179,9 +229,7 @@ def _task_from_row(row) -> DurableGoalTask:
         stage=str(row["stage"]),
         attempt=int(row["attempt"]),
         expected_run_id=(
-            int(row["expected_run_id"])
-            if row["expected_run_id"] is not None
-            else None
+            int(row["expected_run_id"]) if row["expected_run_id"] is not None else None
         ),
         expected_candidate_sha=row["expected_candidate_sha"],
         completion_event_id=(
@@ -206,7 +254,7 @@ def create_durable_goal(
     repair_budget: int,
     review_retry_budget: int,
 ) -> DurableGoalCreated:
-    """Create one gateway-routed durable goal and its initial BUILD task."""
+    """Create a history-compatible V1 record that V2 will never execute."""
     goal_id, task_id = kb.create_durable_goal_record(
         conn,
         objective=objective,
@@ -218,8 +266,50 @@ def create_durable_goal(
         reviewer_skill_digest=reviewer_skill_digest,
         repair_budget=repair_budget,
         review_retry_budget=review_retry_budget,
+        schema_version=1,
+        protocol_version=1,
+    )
+    return DurableGoalCreated(goal_id=goal_id, task_id=task_id)
+
+
+def create_trusted_durable_goal(
+    conn,
+    *,
+    contract: TaskContract,
+    origin: GoalOrigin,
+    board: str,
+    resolver_id: str,
+    verify_promote_adapter_id: str,
+    orchestrator_profile: str,
+    builder_profile: str,
+    reviewer_profile: str,
+    reviewer_skill_digest: Optional[str],
+    repair_budget: int,
+    review_retry_budget: int,
+) -> DurableGoalCreated:
+    """Create one immutable-contract Workflow V2 goal and initial PLAN task."""
+    try:
+        contract_payload = contract.as_payload()
+        canonical_contract = TaskContract.from_payload(contract_payload)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("trusted task contract hash is invalid") from None
+    contract = canonical_contract
+    goal_id, task_id = kb.create_trusted_durable_goal_record(
+        conn,
+        task_contract=contract.as_payload(),
+        board_slug=board,
+        origin=origin.as_record(),
+        resolver_id=resolver_id,
+        verify_promote_adapter_id=verify_promote_adapter_id,
+        orchestrator_profile=orchestrator_profile,
+        builder_profile=builder_profile,
+        reviewer_profile=reviewer_profile,
+        reviewer_skill_digest=reviewer_skill_digest,
+        repair_budget=repair_budget,
+        review_retry_budget=review_retry_budget,
         schema_version=DURABLE_GOAL_SCHEMA_VERSION,
         protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        workflow_version=DURABLE_GOAL_WORKFLOW_VERSION,
     )
     return DurableGoalCreated(goal_id=goal_id, task_id=task_id)
 
@@ -259,8 +349,7 @@ def mark_durable_goal_completed_by_owner(
 
 def list_durable_goal_tasks(conn, goal_id: str) -> list[DurableGoalTask]:
     return [
-        _task_from_row(row)
-        for row in kb.list_durable_goal_task_rows(conn, goal_id)
+        _task_from_row(row) for row in kb.list_durable_goal_task_rows(conn, goal_id)
     ]
 
 
@@ -290,6 +379,109 @@ def list_goal_notifications(conn, goal_id: str) -> list[GoalNotification]:
             )
         )
     return notifications
+
+
+def apply_trusted_stage_result(
+    conn,
+    goal_id: str,
+    evidence: PromotionEvidence,
+) -> SupervisionResult:
+    """Apply precomputed deterministic evidence; never execute an adapter."""
+    goal = get_durable_goal(conn, goal_id)
+    if goal is None:
+        return SupervisionResult("NOOP", goal_id, reason="unknown_goal")
+    if (
+        goal.status != "ACTIVE"
+        or goal.workflow_version != DURABLE_GOAL_WORKFLOW_VERSION
+        or goal.current_stage != "VERIFY_PROMOTE"
+        or goal.task_contract is None
+        or not isinstance(evidence, PromotionEvidence)
+        or not evidence.verify_hash()
+    ):
+        return SupervisionResult("NOOP", goal_id, reason="invalid_trusted_stage_state")
+    contract = goal.task_contract
+    if (
+        evidence.adapter_id != goal.verify_promote_adapter_id
+        or evidence.contract_hash != contract.contract_hash
+        or evidence.base_revision != contract.base_revision
+        or evidence.scope != contract.scope
+        or evidence.gates != contract.gates
+        or evidence.candidate_sha != goal.candidate_sha
+    ):
+        return SupervisionResult("NOOP", goal_id, reason="trusted_evidence_mismatch")
+    source_rows = [
+        binding
+        for binding in list_durable_goal_tasks(conn, goal.id)
+        if binding.completion_event_id is not None
+        and (
+            binding.stage == "BUILD_CANDIDATE"
+            or binding.stage.startswith("REPAIR_BUILD_")
+        )
+    ]
+    if not source_rows:
+        return SupervisionResult("NOOP", goal_id, reason="missing_build_source")
+    source = max(source_rows, key=lambda binding: binding.attempt)
+    if evidence.attempt != source.attempt:
+        return SupervisionResult("NOOP", goal_id, reason="stale_trusted_evidence")
+    if evidence.classification == ResultClassification.PASS:
+        successor = kb.transition_durable_goal_from_waiting_to_successor(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            expected_waiting_stage="VERIFY_PROMOTE",
+            source_task_id=source.task_id,
+            next_stage="REVIEW",
+            next_attempt=source.attempt,
+            assignee=goal.reviewer_profile,
+            evidence=evidence.as_payload(),
+            candidate_sha=evidence.candidate_sha,
+            task_status="review",
+            skills=("immutable-change-reviews",),
+        )
+        if successor is None:
+            return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+        return SupervisionResult("CREATED_REVIEW", goal.id, successor)
+    if evidence.classification == ResultClassification.REPAIRABLE_FAILURE:
+        successor = kb.transition_durable_goal_from_waiting_to_successor(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            expected_waiting_stage="VERIFY_PROMOTE",
+            source_task_id=source.task_id,
+            next_stage="ADJUDICATE",
+            next_attempt=source.attempt,
+            assignee=str(goal.orchestrator_profile or ""),
+            evidence=evidence.as_payload(),
+            candidate_sha=evidence.candidate_sha,
+        )
+        if successor is None:
+            return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+        return SupervisionResult("CREATED_ADJUDICATE", goal.id, successor)
+    if evidence.classification == ResultClassification.HARD_BLOCK:
+        transitioned = kb.transition_durable_goal_waiting_to_terminal(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            expected_waiting_stage="VERIFY_PROMOTE",
+            evidence=evidence.as_payload(),
+            terminal_status="BLOCKED",
+            notification_kind="HUMAN_GATE",
+            notification_payload={
+                "goal_id": goal.id,
+                "objective": goal.objective,
+                "candidate_sha": goal.candidate_sha,
+                "status": "BLOCKED",
+                "classification": ResultClassification.HARD_BLOCK.value,
+                "reason": evidence.summary,
+            },
+            blocked_reason=evidence.summary,
+        )
+        if not transitioned:
+            return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+        return SupervisionResult("HUMAN_GATE", goal.id, reason=evidence.summary)
+    return SupervisionResult(
+        evidence.classification.value, goal.id, reason=evidence.summary
+    )
 
 
 def check_durable_goal_runtime(
@@ -390,8 +582,18 @@ def preflight_durable_dispatch(
         return DispatchPreflight(False, True, "durable goal is not active")
 
     reason = None
-    if str(board) != goal.board:
+    if goal.workflow_version != DURABLE_GOAL_WORKFLOW_VERSION:
+        reason = (
+            f"durable workflow V{goal.workflow_version} is retired; "
+            "owner intervention is required"
+        )
+    elif str(board) != goal.board:
         reason = f"foreign board: expected {goal.board}, got {board}"
+    elif goal.schema_version != DURABLE_GOAL_SCHEMA_VERSION:
+        reason = (
+            "durable goal schema mismatch: "
+            f"goal={goal.schema_version}, runtime={DURABLE_GOAL_SCHEMA_VERSION}"
+        )
     elif runtime_protocol_version is None:
         reason = "durable goal protocol unavailable in dispatcher runtime"
     else:
@@ -479,88 +681,556 @@ def _validated_terminal_event(conn, binding: DurableGoalTask):
     return None
 
 
-def _structured_completion_payload(
+def _structured_v2_authority_payload(
     conn,
+    goal: DurableGoal,
     binding: DurableGoalTask,
     event,
     *,
     expected_stage: str,
-    expected_outcome: str,
+    expected_authority: str,
+    expected_profile: str,
 ) -> Optional[dict[str, Any]]:
+    """Validate a V2 LLM result against its immutable/current authority."""
+    contract = goal.task_contract
+    if contract is None:
+        return None
     run = kb.get_run(conn, int(event["run_id"]))
     payload = (
         run.metadata.get("durable_goal")
         if run is not None and isinstance(run.metadata, dict)
         else None
     )
-    if not isinstance(payload, dict):
+    task = kb.get_task(conn, binding.task_id)
+    if not isinstance(payload, dict) or run is None or task is None:
         return None
     try:
+        workflow_version = int(payload.get("workflow_version"))
         protocol_version = int(payload.get("protocol_version"))
         payload_run_id = int(payload.get("run_id"))
     except (TypeError, ValueError):
         return None
-    candidate_sha = str(payload.get("candidate_sha") or "").strip().lower()
     if (
-        protocol_version != DURABLE_GOAL_PROTOCOL_VERSION
-        or payload_run_id < 1
+        workflow_version != DURABLE_GOAL_WORKFLOW_VERSION
+        or protocol_version != DURABLE_GOAL_PROTOCOL_VERSION
         or payload_run_id != int(event["run_id"])
         or str(payload.get("stage") or "").strip().upper() != expected_stage
-        or str(payload.get("outcome") or "").strip().upper() != expected_outcome
-        or not _CANDIDATE_SHA_RE.fullmatch(candidate_sha)
+        or str(payload.get("authority") or "").strip().lower() != expected_authority
+        or str(run.profile or "").strip().lower() != expected_profile.lower()
+        or str(task.assignee or "").strip().lower() != expected_profile.lower()
+        or str(payload.get("contract_hash") or "").strip() != contract.contract_hash
+        or str(payload.get("base_revision") or "").strip() != contract.base_revision
+        or tuple(str(item) for item in (payload.get("scope") or ())) != contract.scope
+        or tuple(str(item) for item in (payload.get("gates") or ())) != contract.gates
     ):
         return None
+    normalized = dict(payload)
+    normalized.update({
+        "authority": expected_authority,
+        "base_revision": contract.base_revision,
+        "contract_hash": contract.contract_hash,
+        "gates": list(contract.gates),
+        "protocol_version": protocol_version,
+        "run_id": payload_run_id,
+        "scope": list(contract.scope),
+        "stage": expected_stage,
+        "workflow_version": workflow_version,
+    })
+    return normalized
+
+
+def _validate_review_payload(
+    payload: Optional[dict[str, Any]],
+    goal: DurableGoal,
+) -> Optional[dict[str, Any]]:
+    if payload is None:
+        return None
+    candidate_sha = str(payload.get("candidate_sha") or "").strip().lower()
+    verdict_raw = str(payload.get("verdict") or "").strip().upper()
+    if candidate_sha != str(goal.candidate_sha or ""):
+        return None
+    try:
+        verdict = ReviewVerdict(verdict_raw)
+    except ValueError:
+        return None
+    if (
+        goal.reviewer_skill_digest
+        and str(payload.get("reviewer_skill_digest") or "").strip()
+        != goal.reviewer_skill_digest
+    ):
+        return None
+    raw_findings = payload.get("findings") or []
+    if not isinstance(raw_findings, list):
+        return None
+    findings: list[dict[str, Any]] = []
+    for finding in raw_findings:
+        if not isinstance(finding, Mapping):
+            return None
+        severity_raw = str(finding.get("severity") or "").strip().upper()
+        summary = str(finding.get("summary") or "").strip()
+        resolved = finding.get("resolved", False)
+        try:
+            severity = FindingSeverity(severity_raw)
+        except ValueError:
+            return None
+        if not summary or not isinstance(resolved, bool):
+            return None
+        normalized_finding = dict(finding)
+        normalized_finding["severity"] = severity.value
+        normalized_finding["summary"] = summary
+        normalized_finding["resolved"] = resolved
+        findings.append(normalized_finding)
     normalized = dict(payload)
     normalized["candidate_sha"] = candidate_sha
-    normalized["protocol_version"] = protocol_version
-    normalized["run_id"] = payload_run_id
-    normalized["stage"] = expected_stage
-    normalized["outcome"] = expected_outcome
+    normalized["verdict"] = verdict.value
+    normalized["findings"] = findings
     return normalized
 
 
-def _structured_verdict_payload(
+def _latest_completed_review_payload(
     conn,
+    *,
+    goal_id: str,
+    attempt: int,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT completion_payload FROM kanban_goal_tasks "
+        "WHERE goal_id = ? AND (stage = 'REVIEW' OR stage LIKE 'REVIEW_RETRY_%') "
+        "AND attempt = ? "
+        "AND completion_event_id IS NOT NULL",
+        (goal_id, int(attempt)),
+    ).fetchone()
+    return _decode_object(row["completion_payload"]) if row is not None else None
+
+
+def _terminal_event_payload(
+    goal: DurableGoal, binding: DurableGoalTask, event
+) -> dict[str, Any]:
+    return {
+        "workflow_version": DURABLE_GOAL_WORKFLOW_VERSION,
+        "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
+        "stage": binding.stage,
+        "run_id": int(event["run_id"]),
+        "event_kind": str(event["kind"]),
+        "candidate_sha": goal.candidate_sha,
+    }
+
+
+def _block_v2_goal_from_current_event(
+    conn,
+    goal: DurableGoal,
+    binding: DurableGoalTask,
     event,
     *,
-    expected_stage: str,
-    allowed_verdicts: set[str],
-) -> Optional[dict[str, Any]]:
-    run = kb.get_run(conn, int(event["run_id"]))
-    payload = (
-        run.metadata.get("durable_goal")
-        if run is not None and isinstance(run.metadata, dict)
-        else None
+    reason: str,
+    notification_kind: str = "HUMAN_GATE",
+) -> SupervisionResult:
+    payload = _terminal_event_payload(goal, binding, event)
+    payload["reason"] = reason
+    transitioned = kb.transition_durable_goal_to_terminal(
+        conn,
+        goal_id=goal.id,
+        expected_state_version=goal.state_version,
+        predecessor_task_id=binding.task_id,
+        completion_event_id=int(event["id"]),
+        expected_run_id=int(event["run_id"]),
+        completion_payload=payload,
+        terminal_status="BLOCKED",
+        notification_kind=notification_kind,
+        notification_payload={
+            "goal_id": goal.id,
+            "objective": goal.objective,
+            "candidate_sha": goal.candidate_sha,
+            "status": "BLOCKED",
+            "reason": reason,
+        },
+        blocked_reason=reason,
     )
-    if not isinstance(payload, dict):
-        return None
-    try:
-        protocol_version = int(payload.get("protocol_version"))
-        payload_run_id = int(payload.get("run_id"))
-    except (TypeError, ValueError):
-        return None
-    candidate_sha = str(payload.get("candidate_sha") or "").strip().lower()
-    verdict = str(payload.get("verdict") or "").strip().upper()
-    if (
-        protocol_version != DURABLE_GOAL_PROTOCOL_VERSION
-        or payload_run_id < 1
-        or payload_run_id != int(event["run_id"])
-        or str(payload.get("stage") or "").strip().upper() != expected_stage
-        or verdict not in allowed_verdicts
-        or not _CANDIDATE_SHA_RE.fullmatch(candidate_sha)
+    if not transitioned:
+        return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+    return SupervisionResult("BLOCKED", goal.id, binding.task_id, reason)
+
+
+def _retry_v2_review_from_current_event(
+    conn,
+    goal: DurableGoal,
+    binding: DurableGoalTask,
+    event,
+    *,
+    reason: str,
+) -> SupervisionResult:
+    next_attempt = goal.review_attempts_reserved + 1
+    successor = kb.transition_durable_goal_to_successor(
+        conn,
+        goal_id=goal.id,
+        expected_state_version=goal.state_version,
+        predecessor_task_id=binding.task_id,
+        completion_event_id=int(event["id"]),
+        expected_run_id=int(event["run_id"]),
+        next_stage=f"REVIEW_RETRY_{next_attempt}",
+        next_attempt=next_attempt,
+        assignee=goal.reviewer_profile,
+        reserve_budget="review",
+        completion_payload={
+            **_terminal_event_payload(goal, binding, event),
+            "reason": reason,
+        },
+        candidate_sha=goal.candidate_sha,
+        task_status="review",
+        skills=("immutable-change-reviews",),
+    )
+    if successor is None:
+        return _block_v2_goal_from_current_event(
+            conn,
+            goal,
+            binding,
+            event,
+            reason=reason,
+            notification_kind="HUMAN_GATE",
+        )
+    return SupervisionResult("CREATED_SUCCESSOR", goal.id, successor)
+
+
+def _payload_has_blocking_findings(payload: Mapping[str, Any]) -> bool:
+    for finding in payload.get("findings") or []:
+        if not isinstance(finding, Mapping):
+            return True
+        if (
+            str(finding.get("severity") or "").strip().upper() in {"BLOCKER", "MAJOR"}
+            and finding.get("resolved") is not True
+        ):
+            return True
+    return False
+
+
+def _supervise_v2_goal_once(
+    conn,
+    goal: DurableGoal,
+    binding: DurableGoalTask,
+    event,
+) -> SupervisionResult:
+    if event["kind"] in {
+        "blocked",
+        "dependency_wait",
+        "block_loop_detected",
+        "scheduled",
+        "archived",
+        "status",
+    }:
+        return _block_v2_goal_from_current_event(
+            conn,
+            goal,
+            binding,
+            event,
+            reason=f"durable stage {binding.stage} ended with {event['kind']}",
+            notification_kind="HUMAN_GATE",
+        )
+    if event["kind"] == "gave_up":
+        if binding.stage == "BUILD_CANDIDATE" or binding.stage.startswith(
+            "REPAIR_BUILD_"
+        ):
+            return _block_v2_goal_from_current_event(
+                conn,
+                goal,
+                binding,
+                event,
+                reason=f"durable stage {binding.stage} gave up; owner adjudication required",
+                notification_kind="HUMAN_GATE",
+            )
+        if binding.stage.startswith("REVIEW"):
+            return _retry_v2_review_from_current_event(
+                conn,
+                goal,
+                binding,
+                event,
+                reason=f"durable stage {binding.stage} gave up",
+            )
+        return _block_v2_goal_from_current_event(
+            conn,
+            goal,
+            binding,
+            event,
+            reason=f"durable stage {binding.stage} gave up",
+            notification_kind="HUMAN_GATE",
+        )
+    if event["kind"] == "completed" and binding.stage == "PLAN":
+        payload = _structured_v2_authority_payload(
+            conn,
+            goal,
+            binding,
+            event,
+            expected_stage="PLAN",
+            expected_authority=Authority.ORCHESTRATOR.value,
+            expected_profile=str(goal.orchestrator_profile or ""),
+        )
+        decision = str((payload or {}).get("decision") or "").strip().upper()
+        if payload is None:
+            return _block_v2_goal_from_current_event(
+                conn,
+                goal,
+                binding,
+                event,
+                reason="invalid_structured_plan",
+                notification_kind="UNRECOVERABLE_FAILURE",
+            )
+        if decision == PlanDecision.HUMAN_GATE.value:
+            reason = str(payload.get("reason") or "human gate requested").strip()
+            transitioned = kb.transition_durable_goal_to_terminal(
+                conn,
+                goal_id=goal.id,
+                expected_state_version=goal.state_version,
+                predecessor_task_id=binding.task_id,
+                completion_event_id=int(event["id"]),
+                expected_run_id=int(event["run_id"]),
+                completion_payload=payload,
+                terminal_status="BLOCKED",
+                notification_kind="HUMAN_GATE",
+                notification_payload={
+                    "goal_id": goal.id,
+                    "objective": goal.objective,
+                    "status": "BLOCKED",
+                    "reason": reason,
+                },
+                blocked_reason=reason,
+            )
+            if not transitioned:
+                return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+            return SupervisionResult("HUMAN_GATE", goal.id, binding.task_id, reason)
+        if decision != PlanDecision.PLAN_ACCEPTED.value:
+            return SupervisionResult(
+                "NOOP", goal.id, binding.task_id, "invalid_structured_plan"
+            )
+        successor = kb.transition_durable_goal_to_successor(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            predecessor_task_id=binding.task_id,
+            completion_event_id=int(event["id"]),
+            expected_run_id=int(event["run_id"]),
+            next_stage="BUILD_CANDIDATE",
+            next_attempt=0,
+            assignee=goal.builder_profile,
+            completion_payload=payload,
+        )
+        if successor is None:
+            return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+        return SupervisionResult("CREATED_SUCCESSOR", goal.id, successor)
+    if event["kind"] == "completed" and binding.stage.startswith("REVIEW"):
+        payload = _structured_v2_authority_payload(
+            conn,
+            goal,
+            binding,
+            event,
+            expected_stage=binding.stage,
+            expected_authority=Authority.REVIEWER.value,
+            expected_profile=goal.reviewer_profile,
+        )
+        payload = _validate_review_payload(payload, goal)
+        if payload is None:
+            return _retry_v2_review_from_current_event(
+                conn,
+                goal,
+                binding,
+                event,
+                reason="invalid_structured_review",
+            )
+        successor = kb.transition_durable_goal_to_successor(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            predecessor_task_id=binding.task_id,
+            completion_event_id=int(event["id"]),
+            expected_run_id=int(event["run_id"]),
+            next_stage="ADJUDICATE",
+            next_attempt=binding.attempt,
+            assignee=str(goal.orchestrator_profile or ""),
+            completion_payload=payload,
+            candidate_sha=payload["candidate_sha"],
+        )
+        if successor is None:
+            return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+        return SupervisionResult("CREATED_ADJUDICATE", goal.id, successor)
+    if event["kind"] == "completed" and binding.stage == "ADJUDICATE":
+        payload = _structured_v2_authority_payload(
+            conn,
+            goal,
+            binding,
+            event,
+            expected_stage="ADJUDICATE",
+            expected_authority=Authority.ORCHESTRATOR.value,
+            expected_profile=str(goal.orchestrator_profile or ""),
+        )
+        candidate_sha = str((payload or {}).get("candidate_sha") or "").strip().lower()
+        decision_raw = str((payload or {}).get("decision") or "").strip().upper()
+        try:
+            decision = AdjudicationDecision(decision_raw)
+        except ValueError:
+            return _block_v2_goal_from_current_event(
+                conn,
+                goal,
+                binding,
+                event,
+                reason="invalid_structured_adjudication",
+                notification_kind="UNRECOVERABLE_FAILURE",
+            )
+        if payload is None or candidate_sha != str(goal.candidate_sha or ""):
+            return _block_v2_goal_from_current_event(
+                conn,
+                goal,
+                binding,
+                event,
+                reason="invalid_structured_adjudication",
+                notification_kind="UNRECOVERABLE_FAILURE",
+            )
+        review_payload = _latest_completed_review_payload(
+            conn, goal_id=goal.id, attempt=binding.attempt
+        )
+        if decision == AdjudicationDecision.READY_FOR_OWNER:
+            evidence = goal.promotion_evidence or {}
+            if (
+                str(evidence.get("classification") or "")
+                != ResultClassification.PASS.value
+                or str(evidence.get("contract_hash") or "")
+                != goal.task_contract.contract_hash
+                or str(evidence.get("candidate_sha") or "") != candidate_sha
+                or int(evidence.get("attempt", -1)) != binding.attempt
+                or not isinstance(review_payload, dict)
+                or str(review_payload.get("verdict") or "")
+                != ReviewVerdict.APPROVE.value
+                or str(review_payload.get("candidate_sha") or "") != candidate_sha
+                or _payload_has_blocking_findings(review_payload)
+                or bool(payload.get("human_gate"))
+            ):
+                return SupervisionResult(
+                    "NOOP", goal.id, binding.task_id, "ready_validation_failed"
+                )
+            transitioned = kb.transition_durable_goal_to_terminal(
+                conn,
+                goal_id=goal.id,
+                expected_state_version=goal.state_version,
+                predecessor_task_id=binding.task_id,
+                completion_event_id=int(event["id"]),
+                expected_run_id=int(event["run_id"]),
+                completion_payload=payload,
+                terminal_status="READY_FOR_OWNER",
+                notification_kind="READY_FOR_OWNER",
+                notification_payload={
+                    "goal_id": goal.id,
+                    "objective": goal.objective,
+                    "candidate_sha": candidate_sha,
+                    "status": "READY_FOR_OWNER",
+                },
+            )
+            if not transitioned:
+                return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+            return SupervisionResult("READY_FOR_OWNER", goal.id, binding.task_id)
+        if decision == AdjudicationDecision.REPAIR:
+            next_attempt = goal.repair_attempts_reserved + 1
+            successor = kb.transition_durable_goal_to_successor(
+                conn,
+                goal_id=goal.id,
+                expected_state_version=goal.state_version,
+                predecessor_task_id=binding.task_id,
+                completion_event_id=int(event["id"]),
+                expected_run_id=int(event["run_id"]),
+                next_stage=f"REPAIR_BUILD_{next_attempt}",
+                next_attempt=next_attempt,
+                assignee=goal.builder_profile,
+                reserve_budget="repair",
+                completion_payload=payload,
+                candidate_sha=candidate_sha,
+            )
+            if successor is None:
+                return _block_v2_goal_from_current_event(
+                    conn,
+                    goal,
+                    binding,
+                    event,
+                    reason="repair budget exhausted; owner adjudication required",
+                    notification_kind="HUMAN_GATE",
+                )
+            return SupervisionResult("CREATED_REPAIR", goal.id, successor)
+        reason = str(payload.get("reason") or "human gate requested").strip()
+        transitioned = kb.transition_durable_goal_to_terminal(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            predecessor_task_id=binding.task_id,
+            completion_event_id=int(event["id"]),
+            expected_run_id=int(event["run_id"]),
+            completion_payload=payload,
+            terminal_status="BLOCKED",
+            notification_kind="HUMAN_GATE",
+            notification_payload={
+                "goal_id": goal.id,
+                "objective": goal.objective,
+                "candidate_sha": candidate_sha,
+                "status": "BLOCKED",
+                "reason": reason,
+            },
+            blocked_reason=reason,
+        )
+        if not transitioned:
+            return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+        return SupervisionResult("HUMAN_GATE", goal.id, binding.task_id, reason)
+    if event["kind"] == "completed" and (
+        binding.stage == "BUILD_CANDIDATE" or binding.stage.startswith("REPAIR_BUILD_")
     ):
-        return None
-    normalized = dict(payload)
-    normalized.update(
-        {
-            "candidate_sha": candidate_sha,
-            "protocol_version": protocol_version,
-            "run_id": payload_run_id,
-            "stage": expected_stage,
-            "verdict": verdict,
-        }
-    )
-    return normalized
+        payload = _structured_v2_authority_payload(
+            conn,
+            goal,
+            binding,
+            event,
+            expected_stage=binding.stage,
+            expected_authority=Authority.BUILDER.value,
+            expected_profile=goal.builder_profile,
+        )
+        candidate_sha = str((payload or {}).get("candidate_sha") or "").strip().lower()
+        if payload is None or not _CANDIDATE_SHA_RE.fullmatch(candidate_sha):
+            return _block_v2_goal_from_current_event(
+                conn,
+                goal,
+                binding,
+                event,
+                reason="invalid_structured_build",
+                notification_kind="UNRECOVERABLE_FAILURE",
+            )
+        if binding.stage.startswith("REPAIR_BUILD_"):
+            input_candidate_sha = (
+                str(payload.get("input_candidate_sha") or "").strip().lower()
+            )
+            expected_input = (
+                str(binding.expected_candidate_sha or goal.candidate_sha or "")
+                .strip()
+                .lower()
+            )
+            if (
+                not _CANDIDATE_SHA_RE.fullmatch(input_candidate_sha)
+                or input_candidate_sha != expected_input
+            ):
+                return _block_v2_goal_from_current_event(
+                    conn,
+                    goal,
+                    binding,
+                    event,
+                    reason="repair_input_candidate_mismatch",
+                    notification_kind="UNRECOVERABLE_FAILURE",
+                )
+        transitioned = kb.transition_durable_goal_to_waiting_stage(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            predecessor_task_id=binding.task_id,
+            completion_event_id=int(event["id"]),
+            expected_run_id=int(event["run_id"]),
+            completion_payload=payload,
+            waiting_stage="VERIFY_PROMOTE",
+            candidate_sha=candidate_sha,
+        )
+        if not transitioned:
+            return SupervisionResult("NOOP", goal.id, reason="transition_lost")
+        return SupervisionResult("AWAITING_TRUSTED_RESULT", goal.id)
+    return SupervisionResult("NOOP", goal.id, binding.task_id)
 
 
 def supervise_goal_once(
@@ -578,6 +1248,24 @@ def supervise_goal_once(
         return SupervisionResult("NOOP", goal_id, reason="terminal_goal")
     if str(board) != goal.board:
         return SupervisionResult("NOOP", goal_id, reason="foreign_board")
+    if goal.workflow_version != DURABLE_GOAL_WORKFLOW_VERSION:
+        blocked = kb.block_legacy_durable_goal_under_v2(
+            conn,
+            goal_id=goal.id,
+            expected_state_version=goal.state_version,
+            reason="legacy durable goal cannot run under Workflow V2 supervisor",
+        )
+        return SupervisionResult(
+            "HUMAN_GATE" if blocked else "NOOP",
+            goal.id,
+            reason=(
+                "legacy durable goal cannot run under Workflow V2 supervisor"
+                if blocked
+                else "transition_lost"
+            ),
+        )
+    if goal.schema_version != DURABLE_GOAL_SCHEMA_VERSION:
+        return SupervisionResult("NOOP", goal_id, reason="schema_mismatch")
     if int(runtime_protocol_version) != goal.protocol_version:
         return SupervisionResult("NOOP", goal_id, reason="protocol_mismatch")
     binding = _current_binding(conn, goal)
@@ -587,529 +1275,7 @@ def supervise_goal_once(
     if event is None:
         return SupervisionResult("NOOP", goal_id, task_id=binding.task_id)
 
-    if event["kind"] in {
-        "blocked",
-        "dependency_wait",
-        "block_loop_detected",
-        "scheduled",
-        "archived",
-        "status",
-    }:
-        event_payload = _decode_object(event["payload"]) or {}
-        event_reason = str(event_payload.get("reason") or "").strip()
-        event_label = str(event["kind"])
-        if event_label == "status":
-            current_task = kb.get_task(conn, binding.task_id)
-            direct_status = str(
-                (current_task.status if current_task is not None else None)
-                or event_payload.get("status")
-                or "unknown"
-            ).strip()
-            event_label = f"status:{direct_status}"
-        reason = f"durable task {event_label} during {binding.stage}"
-        if event_reason:
-            reason = f"{reason}: {event_reason}"
-        completion_payload = dict(event_payload)
-        completion_payload["event"] = event_label
-        blocked = kb.transition_durable_goal_to_terminal(
-            conn,
-            goal_id=goal.id,
-            expected_state_version=goal.state_version,
-            predecessor_task_id=binding.task_id,
-            completion_event_id=int(event["id"]),
-            expected_run_id=int(event["run_id"]),
-            completion_payload=completion_payload,
-            terminal_status="BLOCKED",
-            notification_kind="BLOCKED",
-            notification_payload={
-                "goal_id": goal.id,
-                "objective": goal.objective,
-                "candidate_sha": goal.candidate_sha,
-                "status": "BLOCKED",
-                "event": event_label,
-                "reason": reason,
-            },
-            blocked_reason=reason,
-        )
-        if not blocked:
-            return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-        return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-
-    if event["kind"] == "gave_up" and (
-        binding.stage == "BUILD" or binding.stage.startswith("REPAIR_BUILD_")
-    ):
-        next_attempt = goal.repair_attempts_reserved + 1
-        if next_attempt > goal.repair_budget:
-            reason = f"repair budget exhausted after {binding.stage}"
-            payload = _decode_object(event["payload"]) or {
-                "event": "gave_up"
-            }
-            blocked = kb.transition_durable_goal_to_terminal(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                completion_payload=payload,
-                terminal_status="BLOCKED",
-                notification_kind="UNRECOVERABLE_FAILURE",
-                notification_payload={
-                    "goal_id": goal.id,
-                    "objective": goal.objective,
-                    "candidate_sha": goal.candidate_sha,
-                    "status": "BLOCKED",
-                    "reason": reason,
-                },
-                blocked_reason=reason,
-            )
-            if not blocked:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-        next_stage = f"REPAIR_BUILD_{next_attempt}"
-        successor = kb.transition_durable_goal_to_successor(
-            conn,
-            goal_id=goal.id,
-            expected_state_version=goal.state_version,
-            predecessor_task_id=binding.task_id,
-            completion_event_id=int(event["id"]),
-            expected_run_id=int(event["run_id"]),
-            next_stage=next_stage,
-            next_attempt=next_attempt,
-            assignee=goal.builder_profile,
-            reserve_budget="repair",
-        )
-        if successor is None:
-            return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-        return SupervisionResult("CREATED_SUCCESSOR", goal_id, successor)
-
-    if event["kind"] == "completed" and (
-        binding.stage == "BUILD" or binding.stage.startswith("REPAIR_BUILD_")
-    ):
-        payload = _structured_completion_payload(
-            conn,
-            binding,
-            event,
-            expected_stage="BUILD",
-            expected_outcome="BUILT",
-        )
-        if payload is None:
-            reason = "invalid structured BUILD payload for current run"
-            blocked = kb.transition_durable_goal_to_terminal(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                completion_payload={"validation_error": reason},
-                terminal_status="BLOCKED",
-                notification_kind="UNRECOVERABLE_FAILURE",
-                notification_payload={
-                    "goal_id": goal.id,
-                    "objective": goal.objective,
-                    "status": "BLOCKED",
-                    "reason": reason,
-                },
-                blocked_reason=reason,
-            )
-            if not blocked:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-        candidate_sha = payload["candidate_sha"]
-        is_repair = binding.stage.startswith("REPAIR_BUILD_")
-        if is_repair:
-            input_candidate_sha = str(
-                payload.get("input_candidate_sha") or ""
-            ).strip().lower()
-            if goal.candidate_sha and input_candidate_sha != goal.candidate_sha:
-                reason = (
-                    "structured REPAIR input candidate SHA does not match "
-                    "the failed candidate"
-                )
-                blocked = kb.transition_durable_goal_to_terminal(
-                    conn,
-                    goal_id=goal.id,
-                    expected_state_version=goal.state_version,
-                    predecessor_task_id=binding.task_id,
-                    completion_event_id=int(event["id"]),
-                    expected_run_id=int(event["run_id"]),
-                    completion_payload=payload,
-                    terminal_status="BLOCKED",
-                    notification_kind="UNRECOVERABLE_FAILURE",
-                    notification_payload={
-                        "goal_id": goal.id,
-                        "objective": goal.objective,
-                        "status": "BLOCKED",
-                        "reason": reason,
-                        "expected_candidate_sha": goal.candidate_sha,
-                        "reported_input_candidate_sha": input_candidate_sha,
-                    },
-                    blocked_reason=reason,
-                )
-                if not blocked:
-                    return SupervisionResult(
-                        "NOOP", goal_id, reason="transition_lost"
-                    )
-                return SupervisionResult(
-                    "BLOCKED", goal_id, binding.task_id, reason
-                )
-        elif goal.candidate_sha and goal.candidate_sha != candidate_sha:
-            return SupervisionResult(
-                "NOOP", goal_id, binding.task_id, "candidate_sha_mismatch"
-            )
-        successor = kb.transition_durable_goal_to_successor(
-            conn,
-            goal_id=goal.id,
-            expected_state_version=goal.state_version,
-            predecessor_task_id=binding.task_id,
-            completion_event_id=int(event["id"]),
-            expected_run_id=int(event["run_id"]),
-            next_stage="VERIFY",
-            next_attempt=binding.attempt if is_repair else 0,
-            assignee=goal.verifier_profile,
-            completion_payload=payload,
-            candidate_sha=candidate_sha,
-        )
-        if successor is None:
-            return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-        return SupervisionResult("CREATED_SUCCESSOR", goal_id, successor)
-
-    if event["kind"] == "completed" and binding.stage == "VERIFY":
-        payload = _structured_verdict_payload(
-            conn,
-            event,
-            expected_stage="VERIFY",
-            allowed_verdicts={"PASS", "FAIL"},
-        )
-        if payload is None:
-            reason = "invalid structured VERIFY payload for current run"
-            blocked = kb.transition_durable_goal_to_terminal(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                completion_payload={"validation_error": reason},
-                terminal_status="BLOCKED",
-                notification_kind="UNRECOVERABLE_FAILURE",
-                notification_payload={
-                    "goal_id": goal.id,
-                    "objective": goal.objective,
-                    "candidate_sha": goal.candidate_sha,
-                    "status": "BLOCKED",
-                    "reason": reason,
-                },
-                blocked_reason=reason,
-            )
-            if not blocked:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-        if payload["candidate_sha"] != goal.candidate_sha:
-            reason = "structured VERIFY candidate SHA does not match built candidate"
-            blocked = kb.transition_durable_goal_to_terminal(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                completion_payload=payload,
-                terminal_status="BLOCKED",
-                notification_kind="UNRECOVERABLE_FAILURE",
-                notification_payload={
-                    "goal_id": goal.id,
-                    "objective": goal.objective,
-                    "status": "BLOCKED",
-                    "reason": reason,
-                    "expected_candidate_sha": goal.candidate_sha,
-                    "reported_candidate_sha": payload["candidate_sha"],
-                },
-                blocked_reason=reason,
-            )
-            if not blocked:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-        if payload["verdict"] != "PASS":
-            next_attempt = goal.repair_attempts_reserved + 1
-            if next_attempt <= goal.repair_budget:
-                successor = kb.transition_durable_goal_to_successor(
-                    conn,
-                    goal_id=goal.id,
-                    expected_state_version=goal.state_version,
-                    predecessor_task_id=binding.task_id,
-                    completion_event_id=int(event["id"]),
-                    expected_run_id=int(event["run_id"]),
-                    next_stage=f"REPAIR_BUILD_{next_attempt}",
-                    next_attempt=next_attempt,
-                    assignee=goal.builder_profile,
-                    reserve_budget="repair",
-                    completion_payload=payload,
-                    candidate_sha=goal.candidate_sha,
-                )
-                if successor is None:
-                    return SupervisionResult(
-                        "NOOP", goal_id, reason="transition_lost"
-                    )
-                return SupervisionResult(
-                    "CREATED_SUCCESSOR", goal_id, successor
-                )
-            reason = "repair budget exhausted after structured VERIFY failure"
-            blocked = kb.transition_durable_goal_to_terminal(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                completion_payload=payload,
-                terminal_status="BLOCKED",
-                notification_kind="UNRECOVERABLE_FAILURE",
-                notification_payload={
-                    "goal_id": goal.id,
-                    "objective": goal.objective,
-                    "candidate_sha": goal.candidate_sha,
-                    "status": "BLOCKED",
-                    "reason": reason,
-                    "failures": payload.get("failures", []),
-                },
-                blocked_reason=reason,
-            )
-            if not blocked:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-        successor = kb.transition_durable_goal_to_successor(
-            conn,
-            goal_id=goal.id,
-            expected_state_version=goal.state_version,
-            predecessor_task_id=binding.task_id,
-            completion_event_id=int(event["id"]),
-            expected_run_id=int(event["run_id"]),
-            next_stage="REVIEW",
-            next_attempt=0,
-            assignee=goal.reviewer_profile,
-            completion_payload=payload,
-            candidate_sha=goal.candidate_sha,
-            task_status="review",
-            skills=["immutable-change-reviews"],
-        )
-        if successor is None:
-            return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-        return SupervisionResult("CREATED_SUCCESSOR", goal_id, successor)
-
-    if event["kind"] == "gave_up" and binding.stage.startswith("REVIEW"):
-        # The dispatcher may emit transient crashed/timed_out events while a
-        # worker is being retried. The supervisor only acts on the circuit
-        # breaker's terminal gave_up event, which is already exact-current-run
-        # validated by _validated_terminal_event().
-        next_attempt = goal.review_attempts_reserved + 1
-        event_payload = _decode_object(event["payload"]) or {"event": "gave_up"}
-        if next_attempt <= goal.review_retry_budget:
-            next_stage = f"REVIEW_RETRY_{next_attempt}"
-            successor = kb.transition_durable_goal_to_successor(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                next_stage=next_stage,
-                next_attempt=next_attempt,
-                assignee=goal.reviewer_profile,
-                reserve_budget="review",
-                completion_payload=event_payload,
-                candidate_sha=goal.candidate_sha,
-                task_status="review",
-                skills=["immutable-change-reviews"],
-            )
-            if successor is None:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("CREATED_SUCCESSOR", goal_id, successor)
-        reason = f"review retry budget exhausted after {binding.stage} gave_up"
-        blocked = kb.transition_durable_goal_to_terminal(
-            conn,
-            goal_id=goal.id,
-            expected_state_version=goal.state_version,
-            predecessor_task_id=binding.task_id,
-            completion_event_id=int(event["id"]),
-            expected_run_id=int(event["run_id"]),
-            completion_payload=event_payload,
-            terminal_status="BLOCKED",
-            notification_kind="UNRECOVERABLE_FAILURE",
-            notification_payload={
-                "goal_id": goal.id,
-                "objective": goal.objective,
-                "candidate_sha": goal.candidate_sha,
-                "status": "BLOCKED",
-                "reason": reason,
-            },
-            blocked_reason=reason,
-        )
-        if not blocked:
-            return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-        return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-
-    if event["kind"] == "completed" and binding.stage.startswith("REVIEW"):
-        event_payload = _decode_object(event["payload"])
-        if not event_payload or event_payload.get("dispatch_role") != "reviewer":
-            reason = "structured REVIEW completion is missing reviewer role authority"
-            blocked = kb.transition_durable_goal_to_terminal(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                completion_payload={"validation_error": reason},
-                terminal_status="BLOCKED",
-                notification_kind="UNRECOVERABLE_FAILURE",
-                notification_payload={
-                    "goal_id": goal.id,
-                    "objective": goal.objective,
-                    "candidate_sha": goal.candidate_sha,
-                    "status": "BLOCKED",
-                    "reason": reason,
-                },
-                blocked_reason=reason,
-            )
-            if not blocked:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-        payload = _structured_verdict_payload(
-            conn,
-            event,
-            expected_stage="REVIEW",
-            allowed_verdicts={"APPROVE", "BLOCKER", "MAJOR"},
-        )
-        if payload is None:
-            next_attempt = goal.review_attempts_reserved + 1
-            if next_attempt <= goal.review_retry_budget:
-                next_stage = f"REVIEW_RETRY_{next_attempt}"
-                successor = kb.transition_durable_goal_to_successor(
-                    conn,
-                    goal_id=goal.id,
-                    expected_state_version=goal.state_version,
-                    predecessor_task_id=binding.task_id,
-                    completion_event_id=int(event["id"]),
-                    expected_run_id=int(event["run_id"]),
-                    next_stage=next_stage,
-                    next_attempt=next_attempt,
-                    assignee=goal.reviewer_profile,
-                    reserve_budget="review",
-                    completion_payload={
-                        "validation_error": "malformed structured REVIEW payload"
-                    },
-                    candidate_sha=goal.candidate_sha,
-                    task_status="review",
-                    skills=["immutable-change-reviews"],
-                )
-                if successor is None:
-                    return SupervisionResult(
-                        "NOOP", goal_id, reason="transition_lost"
-                    )
-                return SupervisionResult(
-                    "CREATED_SUCCESSOR", goal_id, successor
-                )
-            reason = "review retry budget exhausted after malformed structured REVIEW payload"
-            blocked = kb.transition_durable_goal_to_terminal(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                completion_payload={"validation_error": reason},
-                terminal_status="BLOCKED",
-                notification_kind="UNRECOVERABLE_FAILURE",
-                notification_payload={
-                    "goal_id": goal.id,
-                    "objective": goal.objective,
-                    "candidate_sha": goal.candidate_sha,
-                    "status": "BLOCKED",
-                    "reason": reason,
-                },
-                blocked_reason=reason,
-            )
-            if not blocked:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-        if payload["candidate_sha"] != goal.candidate_sha:
-            reason = "structured REVIEW candidate SHA does not match verified candidate"
-            blocked = kb.transition_durable_goal_to_terminal(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                completion_payload=payload,
-                terminal_status="BLOCKED",
-                notification_kind="UNRECOVERABLE_FAILURE",
-                notification_payload={
-                    "goal_id": goal.id,
-                    "objective": goal.objective,
-                    "status": "BLOCKED",
-                    "reason": reason,
-                    "expected_candidate_sha": goal.candidate_sha,
-                    "reported_candidate_sha": payload["candidate_sha"],
-                },
-                blocked_reason=reason,
-            )
-            if not blocked:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-        if payload["verdict"] != "APPROVE":
-            verdict = payload["verdict"]
-            reason = f"structured REVIEW verdict {verdict}"
-            blocked = kb.transition_durable_goal_to_terminal(
-                conn,
-                goal_id=goal.id,
-                expected_state_version=goal.state_version,
-                predecessor_task_id=binding.task_id,
-                completion_event_id=int(event["id"]),
-                expected_run_id=int(event["run_id"]),
-                completion_payload=payload,
-                terminal_status="BLOCKED",
-                notification_kind="BLOCKED" if verdict == "BLOCKER" else "MAJOR",
-                notification_payload={
-                    "goal_id": goal.id,
-                    "objective": goal.objective,
-                    "candidate_sha": goal.candidate_sha,
-                    "status": "BLOCKED",
-                    "verdict": verdict,
-                    "findings": payload.get("findings", []),
-                    "reason": reason,
-                },
-                blocked_reason=reason,
-            )
-            if not blocked:
-                return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-            return SupervisionResult("BLOCKED", goal_id, binding.task_id, reason)
-        ready = kb.transition_durable_goal_to_terminal(
-            conn,
-            goal_id=goal.id,
-            expected_state_version=goal.state_version,
-            predecessor_task_id=binding.task_id,
-            completion_event_id=int(event["id"]),
-            expected_run_id=int(event["run_id"]),
-            completion_payload=payload,
-            terminal_status="READY_FOR_OWNER",
-            notification_kind="READY_FOR_OWNER",
-            notification_payload={
-                "goal_id": goal.id,
-                "objective": goal.objective,
-                "candidate_sha": goal.candidate_sha,
-                "status": "READY_FOR_OWNER",
-            },
-        )
-        if not ready:
-            return SupervisionResult("NOOP", goal_id, reason="transition_lost")
-        return SupervisionResult("READY_FOR_OWNER", goal_id, binding.task_id)
-
-    return SupervisionResult(
-        "NOOP", goal_id, binding.task_id, f"unhandled_{event['kind']}"
-    )
+    return _supervise_v2_goal_once(conn, goal, binding, event)
 
 
 def supervise_board_once(
@@ -1138,6 +1304,7 @@ def supervise_board_once(
 __all__ = [
     "DURABLE_GOAL_PROTOCOL_VERSION",
     "DURABLE_GOAL_SCHEMA_VERSION",
+    "DURABLE_GOAL_WORKFLOW_VERSION",
     "DurableGoal",
     "DurableGoalCreated",
     "DurableGoalTask",
@@ -1146,6 +1313,8 @@ __all__ = [
     "RuntimeCompatibility",
     "SupervisionResult",
     "create_durable_goal",
+    "create_trusted_durable_goal",
+    "apply_trusted_stage_result",
     "check_durable_goal_runtime",
     "get_durable_goal",
     "list_durable_goal_tasks",

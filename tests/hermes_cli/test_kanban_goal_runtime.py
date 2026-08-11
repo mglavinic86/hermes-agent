@@ -14,9 +14,10 @@ from hermes_cli.kanban_goal_supervisor import (
     DURABLE_GOAL_SCHEMA_VERSION,
     GoalOrigin,
     check_durable_goal_runtime,
-    create_durable_goal,
+    create_trusted_durable_goal,
     get_durable_goal,
 )
+from hermes_cli.kanban_trusted_stages import Authority, TaskContract
 
 
 @pytest.fixture
@@ -43,6 +44,31 @@ def kanban_home(tmp_path, monkeypatch):
     )
     kb.write_board_metadata("default", default_workdir=str(repo))
     return home
+
+
+def _create_trusted_goal(conn, *, objective: str, chat_id: str, board: str = "default"):
+    contract = TaskContract.create(
+        reference=f"contract:{chat_id}",
+        objective=objective,
+        base_revision="a" * 40,
+        scope=("src/workflow.py",),
+        gates=("tests",),
+        authority=Authority.ORCHESTRATOR,
+    )
+    return create_trusted_durable_goal(
+        conn,
+        contract=contract,
+        origin=GoalOrigin(platform="telegram", chat_id=chat_id),
+        board=board,
+        resolver_id="static-contracts",
+        verify_promote_adapter_id="fake-verify-promote",
+        orchestrator_profile="orchestrator",
+        builder_profile="builder",
+        reviewer_profile="reviewer",
+        reviewer_skill_digest="1" * 64,
+        repair_budget=1,
+        review_retry_budget=1,
+    )
 
 
 def test_runtime_lease_requires_exact_fresh_schema_and_protocol(kanban_home):
@@ -90,31 +116,19 @@ def test_supervised_task_is_invisible_without_protocol_and_claimable_with_exact_
         return 123
 
     with kb.connect() as conn:
-        incompatible = create_durable_goal(
+        incompatible = _create_trusted_goal(
             conn,
             objective="Do not expose this to an unstamped dispatcher",
-            origin=GoalOrigin(platform="telegram", chat_id="owner"),
-            board="default",
-            builder_profile="builder",
-            verifier_profile="verifier",
-            reviewer_profile="reviewer",
-            repair_budget=1,
-            review_retry_budget=1,
+            chat_id="owner",
         )
         initial = kb.get_task(conn, incompatible.task_id)
         unstamped = kb.dispatch_once(conn, board="default", spawn_fn=_spawn)
         blocked_goal = get_durable_goal(conn, incompatible.goal_id)
 
-        compatible = create_durable_goal(
+        compatible = _create_trusted_goal(
             conn,
             objective="Dispatch only with the exact runtime protocol",
-            origin=GoalOrigin(platform="telegram", chat_id="owner-2"),
-            board="default",
-            builder_profile="builder",
-            verifier_profile="verifier",
-            reviewer_profile="reviewer",
-            repair_budget=1,
-            review_retry_budget=1,
+            chat_id="owner-2",
         )
         exact = kb.dispatch_once(
             conn,
@@ -140,16 +154,10 @@ def test_supervised_spawn_failure_requeues_to_private_status(
 
     monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
     with kb.connect() as conn:
-        created = create_durable_goal(
+        created = _create_trusted_goal(
             conn,
             objective="Remain hidden after a transient spawn failure",
-            origin=GoalOrigin(platform="telegram", chat_id="owner"),
-            board="default",
-            builder_profile="builder",
-            verifier_profile="verifier",
-            reviewer_profile="reviewer",
-            repair_budget=1,
-            review_retry_budget=1,
+            chat_id="owner",
         )
 
         result = kb.dispatch_once(
@@ -178,16 +186,11 @@ def test_foreign_board_preflight_blocks_before_worker_run(
     monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
     spawned: list[str] = []
     with kb.connect() as conn:
-        created = create_durable_goal(
+        created = _create_trusted_goal(
             conn,
             objective="Never cross the board authority boundary",
-            origin=GoalOrigin(platform="telegram", chat_id="owner"),
+            chat_id="owner",
             board="expected-board",
-            builder_profile="builder",
-            verifier_profile="verifier",
-            reviewer_profile="reviewer",
-            repair_budget=1,
-            review_retry_budget=1,
         )
         result = kb.dispatch_once(
             conn,
@@ -206,3 +209,34 @@ def test_foreign_board_preflight_blocks_before_worker_run(
     assert goal.blocked_reason == (
         "foreign board: expected expected-board, got foreign-board"
     )
+
+
+def test_v2_schema_skew_blocks_before_worker_run(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        created = _create_trusted_goal(
+            conn,
+            objective="Reject a mixed-schema runtime",
+            chat_id="schema-owner",
+        )
+        conn.execute(
+            "UPDATE kanban_goals SET schema_version = 1 WHERE id = ?",
+            (created.goal_id,),
+        )
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            board="default",
+            spawn_fn=lambda task, *_args, **_kwargs: spawned.append(task.id),
+            durable_goal_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal = get_durable_goal(conn, created.goal_id)
+
+    assert result.spawned == [] and spawned == []
+    assert result.auto_blocked == [created.task_id]
+    assert goal is not None and goal.status == "BLOCKED_CAPABILITY"
+    assert goal.blocked_reason == "durable goal schema mismatch: goal=1, runtime=2"

@@ -19,10 +19,19 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_goal_supervisor import (
     DURABLE_GOAL_PROTOCOL_VERSION,
     DURABLE_GOAL_SCHEMA_VERSION,
+    apply_trusted_stage_result,
     get_durable_goal,
     list_durable_goal_tasks,
     list_goal_notifications,
     supervise_goal_once,
+)
+from hermes_cli.kanban_trusted_stages import (
+    PromotionEvidence,
+    PromotionRequest,
+    ResultClassification,
+    StaticTaskContractResolver,
+    TaskContract,
+    TrustedStageRegistry,
 )
 from tests.gateway.test_kanban_notifier import (
     RecordingAdapter,
@@ -41,6 +50,40 @@ class _SessionStore:
 
     def _generate_session_key(self, _source):
         return "agent:main:telegram:dm:owner-chat"
+
+
+class _FakeVerifyPromoteAdapter:
+    adapter_id = "fixture-adapter"
+
+    def classify(self, request: PromotionRequest) -> PromotionEvidence:
+        return PromotionEvidence.create(
+            adapter_id=self.adapter_id,
+            request=request,
+            classification=ResultClassification.PASS,
+            summary="fixture pass",
+        )
+
+
+def _trusted_registry() -> tuple[TrustedStageRegistry, TaskContract]:
+    contract = TaskContract.create(
+        reference="acceptance-contract",
+        objective="Ship the candidate without merge or deploy",
+        base_revision="a" * 40,
+        scope=("hermes_cli/", "tests/"),
+        gates=("focused-tests",),
+    )
+    resolver = StaticTaskContractResolver(
+        resolver_id="fixture-resolver",
+        contracts={contract.reference: contract},
+    )
+    adapter = _FakeVerifyPromoteAdapter()
+    return (
+        TrustedStageRegistry(
+            resolvers={resolver.resolver_id: resolver},
+            adapters={adapter.adapter_id: adapter},
+        ),
+        contract,
+    )
 
 
 def _init_checkout(path: Path) -> None:
@@ -101,8 +144,12 @@ kanban:
   auto_decompose: false
   durable_goals:
     board: default
+    workflow_version: 2
+    start_mode: trusted_contract
+    task_contract_resolver: fixture-resolver
+    verify_promote_adapter: fixture-adapter
+    orchestrator_profile: orchestrator
     builder_profile: builder
-    verifier_profile: verifier
     reviewer_profile: reviewer
     reviewer_skill_digest: 1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1
     repair_budget: 1
@@ -135,12 +182,14 @@ kanban:
     route_runner.adapters = {}
     route_runner._queued_events = {}
     route_runner._active_profile_name = lambda: "gateway-owner"
+    registry, contract = _trusted_registry()
+    route_runner._trusted_stage_registry = registry
     route_runner._enqueue_fifo = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("durable goals must not enqueue a synthetic user turn")
     )
     initial_messages = [
         MessageEvent(
-            text="/goal durable Ship the candidate without merge or deploy",
+            text="/goal durable contract acceptance-contract",
             message_type=MessageType.COMMAND,
             source=SessionSource(
                 platform=Platform.TELEGRAM,
@@ -161,86 +210,96 @@ kanban:
     assert route_runner._queued_events == {}
     assert initial_messages == []
 
-    # BUILD terminal event, then a process/connection restart before supervision.
+    # PLAN terminal event, then a process/connection restart before supervision.
     with kb.connect() as conn:
-        [build_binding] = list_durable_goal_tasks(conn, goal_id)
-
-        def _build_gave_up(*_args, **_kwargs):
-            raise RuntimeError("build worker gave up")
-
-        dispatched = kb.dispatch_once(
+        [plan_binding] = list_durable_goal_tasks(conn, goal_id)
+        plan = kb.claim_task(conn, plan_binding.task_id, claimer="orchestrator")
+        assert plan is not None and plan.current_run_id is not None
+        assert kb.complete_task(
             conn,
-            board="default",
-            spawn_fn=_build_gave_up,
-            failure_limit=1,
-            durable_goal_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+            plan.id,
+            summary="plan accepted",
+            metadata={
+                "durable_goal": {
+                    "workflow_version": 2,
+                    "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
+                    "stage": "PLAN",
+                    "run_id": plan.current_run_id,
+                    "decision": "PLAN_ACCEPTED",
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "orchestrator",
+                }
+            },
+            expected_run_id=plan.current_run_id,
         )
-        assert dispatched.auto_blocked == [build_binding.task_id]
 
     with kb.connect() as conn:
-        repair_result = supervise_goal_once(
+        build_result = supervise_goal_once(
             conn,
             goal_id,
             board="default",
             runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
         )
-        assert repair_result.action == "CREATED_SUCCESSOR"
+        assert build_result.action == "CREATED_SUCCESSOR"
 
-    # Restart after successor creation; replay cannot mint another repair.
+    # Restart after successor creation; replay cannot mint another build.
     with kb.connect() as conn:
-        assert supervise_goal_once(
-            conn,
-            goal_id,
-            board="default",
-            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
-        ).action == "NOOP"
-        repair = kb.claim_task(conn, repair_result.task_id, claimer="builder")
-        assert repair is not None and repair.current_run_id is not None
+        assert (
+            supervise_goal_once(
+                conn,
+                goal_id,
+                board="default",
+                runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+            ).action
+            == "NOOP"
+        )
+        build = kb.claim_task(conn, build_result.task_id, claimer="builder")
+        assert build is not None and build.current_run_id is not None
         candidate_sha = "a" * 40
         assert kb.complete_task(
             conn,
-            repair.id,
-            summary="repair built candidate",
+            build.id,
+            summary="built candidate",
             metadata={
                 "durable_goal": {
+                    "workflow_version": 2,
                     "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
-                    "stage": "BUILD",
-                    "run_id": repair.current_run_id,
+                    "stage": "BUILD_CANDIDATE",
+                    "run_id": build.current_run_id,
                     "candidate_sha": candidate_sha,
-                    "outcome": "BUILT",
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "builder",
                 }
             },
-            expected_run_id=repair.current_run_id,
+            expected_run_id=build.current_run_id,
         )
-        verify_result = supervise_goal_once(
+        waiting = supervise_goal_once(
             conn,
             goal_id,
             board="default",
             runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
         )
-        verify = kb.claim_task(conn, verify_result.task_id, claimer="verifier")
-        assert verify is not None and verify.current_run_id is not None
-        assert kb.complete_task(
-            conn,
-            verify.id,
-            summary="verified",
-            metadata={
-                "durable_goal": {
-                    "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
-                    "stage": "VERIFY",
-                    "run_id": verify.current_run_id,
-                    "candidate_sha": candidate_sha,
-                    "verdict": "PASS",
-                }
-            },
-            expected_run_id=verify.current_run_id,
+        assert waiting.action == "AWAITING_TRUSTED_RESULT"
+        evidence = PromotionEvidence.create(
+            adapter_id="fixture-adapter",
+            request=PromotionRequest(
+                contract_hash=contract.contract_hash,
+                base_revision=contract.base_revision,
+                scope=contract.scope,
+                gates=contract.gates,
+                candidate_sha=candidate_sha,
+                attempt=0,
+            ),
+            classification=ResultClassification.PASS,
+            summary="deterministic gates passed",
         )
-        review_result = supervise_goal_once(
-            conn,
-            goal_id,
-            board="default",
-            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
-        )
+        review_result = apply_trusted_stage_result(conn, goal_id, evidence)
         review = kb.claim_review_task(
             conn,
             review_result.task_id,
@@ -255,14 +314,53 @@ kanban:
             metadata={
                 "_kanban_dispatch_role": "reviewer",
                 "durable_goal": {
+                    "workflow_version": 2,
                     "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
                     "stage": "REVIEW",
                     "run_id": review.current_run_id,
                     "candidate_sha": candidate_sha,
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "reviewer",
                     "verdict": "APPROVE",
+                    "findings": [{"severity": "MINOR", "summary": "ok"}],
+                    "reviewer_skill_digest": "1e74b219dbf5377886fde11fcc873c673d3c01178a007ed9667a0942f8f10ec1",
                 },
             },
             expected_run_id=review.current_run_id,
+        )
+        adjudicate_result = supervise_goal_once(
+            conn,
+            goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        adjudicate = kb.claim_task(
+            conn, adjudicate_result.task_id, claimer="orchestrator"
+        )
+        assert adjudicate is not None and adjudicate.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            adjudicate.id,
+            summary="ready for owner",
+            metadata={
+                "durable_goal": {
+                    "workflow_version": 2,
+                    "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
+                    "stage": "ADJUDICATE",
+                    "run_id": adjudicate.current_run_id,
+                    "candidate_sha": candidate_sha,
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "orchestrator",
+                    "decision": "READY_FOR_OWNER",
+                }
+            },
+            expected_run_id=adjudicate.current_run_id,
         )
 
     # Crash/restart after REVIEW completion but before READY transition/delivery.
@@ -278,15 +376,13 @@ kanban:
 
     assert goal is not None and goal.status == "READY_FOR_OWNER"
     assert [binding.stage for binding in bindings] == [
-        "BUILD",
-        "REPAIR_BUILD_1",
-        "VERIFY",
+        "PLAN",
+        "BUILD_CANDIDATE",
         "REVIEW",
+        "ADJUDICATE",
     ]
     assert len({binding.task_id for binding in bindings}) == 4
-    assert [notification.kind for notification in notifications] == [
-        "READY_FOR_OWNER"
-    ]
+    assert [notification.kind for notification in notifications] == ["READY_FOR_OWNER"]
 
     adapter = RecordingAdapter()
     first_notifier = _make_runner(adapter)

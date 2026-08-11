@@ -11,11 +11,18 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_goal_supervisor import (
     DURABLE_GOAL_PROTOCOL_VERSION,
     GoalOrigin,
-    create_durable_goal,
+    apply_trusted_stage_result,
+    create_trusted_durable_goal,
     get_durable_goal,
     list_durable_goal_tasks,
     list_goal_notifications,
     supervise_goal_once,
+)
+from hermes_cli.kanban_trusted_stages import (
+    PromotionEvidence,
+    PromotionRequest,
+    ResultClassification,
+    TaskContract,
 )
 
 
@@ -175,16 +182,22 @@ def test_goal_outbox_expired_claim_reclaims_delivers_and_acks_once(
             claim_timeout_seconds=120,
         )
         assert claimed["claim_token"]
-        assert kb.count_pending_durable_goal_notifications(
-            db_path=db_path,
-            now=119,
-            claim_timeout_seconds=120,
-        ) == 1
-        assert kb.count_pending_durable_goal_notifications(
-            db_path=db_path,
-            now=221,
-            claim_timeout_seconds=120,
-        ) == 1
+        assert (
+            kb.count_pending_durable_goal_notifications(
+                db_path=db_path,
+                now=119,
+                claim_timeout_seconds=120,
+            )
+            == 1
+        )
+        assert (
+            kb.count_pending_durable_goal_notifications(
+                db_path=db_path,
+                now=221,
+                claim_timeout_seconds=120,
+            )
+            == 1
+        )
     finally:
         conn.close()
 
@@ -207,9 +220,7 @@ def test_goal_outbox_expired_claim_reclaims_delivers_and_acks_once(
         conn.close()
 
 
-def test_goal_outbox_send_failure_retries_without_reverting_goal(
-    tmp_path, monkeypatch
-):
+def test_goal_outbox_send_failure_retries_without_reverting_goal(tmp_path, monkeypatch):
     db_path = tmp_path / "goal-outbox-retry.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -275,26 +286,28 @@ def test_goal_outbox_retries_beyond_thirteen_then_recovers_without_duplicate(
             clock["now"] = int(row["next_attempt_at"])
 
     assert unavailable_adapter.attempts == 13
-    assert kb.count_pending_durable_goal_notifications(
-        db_path=db_path,
-        max_attempts=1,
-        now=clock["now"],
-    ) == 1
-    with kb.connect_closing() as conn:
-        assert kb.claim_pending_durable_goal_notifications(
-            conn,
+    assert (
+        kb.count_pending_durable_goal_notifications(
+            db_path=db_path,
             max_attempts=1,
-            now=int(row["next_attempt_at"]) - 1,
-        ) == []
+            now=clock["now"],
+        )
+        == 1
+    )
+    with kb.connect_closing() as conn:
+        assert (
+            kb.claim_pending_durable_goal_notifications(
+                conn,
+                max_attempts=1,
+                now=int(row["next_attempt_at"]) - 1,
+            )
+            == []
+        )
 
     clock["now"] = int(row["next_attempt_at"])
     recovered_adapter = RecordingAdapter()
-    asyncio.run(
-        _run_one_notifier_tick(monkeypatch, _make_runner(recovered_adapter))
-    )
-    asyncio.run(
-        _run_one_notifier_tick(monkeypatch, _make_runner(recovered_adapter))
-    )
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered_adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered_adapter)))
 
     assert len(recovered_adapter.sent) == 1
     assert goal_id in recovered_adapter.sent[0]["text"]
@@ -306,9 +319,7 @@ def test_goal_outbox_retries_beyond_thirteen_then_recovers_without_duplicate(
     assert kb.count_pending_durable_goal_notifications(db_path=db_path) == 0
 
 
-def test_goal_outbox_failure_backoff_delays_increases_and_caps(
-    tmp_path, monkeypatch
-):
+def test_goal_outbox_failure_backoff_delays_increases_and_caps(tmp_path, monkeypatch):
     db_path = tmp_path / "goal-outbox-backoff.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -328,14 +339,20 @@ def test_goal_outbox_failure_backoff_delays_increases_and_caps(
         assert row["next_attempt_at"] == (
             now + kb.DURABLE_GOAL_NOTIFICATION_RETRY_BASE_SECONDS
         )
-        assert kb.count_pending_durable_goal_notifications(
-            db_path=db_path,
-            now=now,
-        ) == 1
-        assert kb.claim_pending_durable_goal_notifications(
-            conn,
-            now=int(row["next_attempt_at"]) - 1,
-        ) == []
+        assert (
+            kb.count_pending_durable_goal_notifications(
+                db_path=db_path,
+                now=now,
+            )
+            == 1
+        )
+        assert (
+            kb.claim_pending_durable_goal_notifications(
+                conn,
+                now=int(row["next_attempt_at"]) - 1,
+            )
+            == []
+        )
 
         now = int(row["next_attempt_at"])
         [claimed] = kb.claim_pending_durable_goal_notifications(conn, now=now)
@@ -368,10 +385,13 @@ def test_goal_outbox_failure_backoff_delays_increases_and_caps(
             row["next_attempt_at"] - now
             == kb.DURABLE_GOAL_NOTIFICATION_RETRY_CAP_SECONDS
         )
-        assert kb.claim_pending_durable_goal_notifications(
-            conn,
-            now=int(row["next_attempt_at"]) - 1,
-        ) == []
+        assert (
+            kb.claim_pending_durable_goal_notifications(
+                conn,
+                now=int(row["next_attempt_at"]) - 1,
+            )
+            == []
+        )
 
 
 def test_goal_outbox_legacy_row_migrates_due_and_immediately_claimable(
@@ -461,107 +481,137 @@ def test_durable_goal_acceptance_chain_delivers_once_without_inbound_replay(
     _init_durable_goal_board(tmp_path, monkeypatch, "durable-acceptance.db")
     monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
     candidate_sha = "a" * 40
+    reviewer_skill_digest = "f" * 64
+    contract = TaskContract.create(
+        reference="acceptance-contract",
+        objective="Ship a deterministic candidate without merge or deploy",
+        base_revision="b" * 40,
+        scope=("tests/gateway/test_kanban_notifier.py",),
+        gates=("focused-test", "no-remote-writes"),
+    )
+    assert contract.verify_hash()
     inbound_user_messages = ["synthetic /goal durable ship deterministic candidate"]
     with kb.connect() as conn:
         assert len(inbound_user_messages) == 1
-        created = create_durable_goal(
+        created = create_trusted_durable_goal(
             conn,
-            objective="Ship a deterministic candidate without merge or deploy",
+            contract=contract,
             origin=GoalOrigin(platform="telegram", chat_id="owner-chat"),
             board="default",
+            resolver_id="fixture-resolver",
+            verify_promote_adapter_id="fixture-adapter",
+            orchestrator_profile="orchestrator",
             builder_profile="builder",
-            verifier_profile="verifier",
             reviewer_profile="reviewer",
+            reviewer_skill_digest=reviewer_skill_digest,
             repair_budget=1,
             review_retry_budget=1,
         )
         inbound_user_messages.clear()
-
-        def _spawn_failure(*_args, **_kwargs):
-            raise RuntimeError("build worker gave up before producing a candidate")
-
-        gave_up = kb.dispatch_once(
-            conn,
-            board="default",
-            spawn_fn=_spawn_failure,
-            failure_limit=1,
-            durable_goal_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
-        )
-        assert gave_up.auto_blocked == [created.task_id]
+        goal_at_plan = get_durable_goal(conn, created.goal_id)
+        plan_bindings = list_durable_goal_tasks(conn, created.goal_id)
+        assert goal_at_plan is not None
+        assert goal_at_plan.workflow_version == 2
+        assert goal_at_plan.current_stage == "PLAN"
+        assert goal_at_plan.task_contract == contract
+        assert goal_at_plan.verifier_profile == ""
+        assert [binding.stage for binding in plan_bindings] == ["PLAN"]
         assert inbound_user_messages == []
 
-        repair_result = supervise_goal_once(
-            conn,
-            created.goal_id,
-            board="default",
-            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
-        )
-        assert repair_result.action == "CREATED_SUCCESSOR"
-        repair_replay = supervise_goal_once(
-            conn,
-            created.goal_id,
-            board="default",
-            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
-        )
-        assert repair_replay.action == "NOOP"
-        assert [
-            task.stage for task in list_durable_goal_tasks(conn, created.goal_id)
-        ] == ["BUILD", "REPAIR_BUILD_1"]
-
-        repair = kb.claim_task(conn, repair_result.task_id, claimer="builder")
-        assert repair is not None and repair.current_run_id is not None
+        plan = kb.claim_task(conn, created.task_id, claimer="orchestrator")
+        assert plan is not None and plan.current_run_id is not None
         assert kb.complete_task(
             conn,
-            repair.id,
-            summary="repair produced candidate",
+            plan.id,
+            summary="plan accepted",
             metadata={
                 "durable_goal": {
+                    "workflow_version": 2,
                     "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
-                    "stage": "BUILD",
-                    "run_id": repair.current_run_id,
-                    "candidate_sha": candidate_sha,
-                    "outcome": "BUILT",
+                    "stage": "PLAN",
+                    "run_id": plan.current_run_id,
+                    "decision": "PLAN_ACCEPTED",
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "orchestrator",
                 }
             },
-            expected_run_id=repair.current_run_id,
+            expected_run_id=plan.current_run_id,
         )
-        verify_result = supervise_goal_once(
+
+        build_result = supervise_goal_once(
             conn,
             created.goal_id,
             board="default",
             runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
         )
-        assert verify_result.action == "CREATED_SUCCESSOR"
+        assert build_result.action == "CREATED_SUCCESSOR"
+        assert build_result.task_id is not None
         assert [
             task.stage for task in list_durable_goal_tasks(conn, created.goal_id)
-        ] == ["BUILD", "REPAIR_BUILD_1", "VERIFY"]
+        ] == ["PLAN", "BUILD_CANDIDATE"]
 
-        verify = kb.claim_task(conn, verify_result.task_id, claimer="verifier")
-        assert verify is not None and verify.current_run_id is not None
+        build = kb.claim_task(conn, build_result.task_id, claimer="builder")
+        assert build is not None and build.current_run_id is not None
         assert kb.complete_task(
             conn,
-            verify.id,
-            summary="candidate passed verification",
+            build.id,
+            summary="built deterministic candidate",
             metadata={
                 "durable_goal": {
+                    "workflow_version": 2,
                     "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
-                    "stage": "VERIFY",
-                    "run_id": verify.current_run_id,
+                    "stage": "BUILD_CANDIDATE",
+                    "run_id": build.current_run_id,
                     "candidate_sha": candidate_sha,
-                    "verdict": "PASS",
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "builder",
                 }
             },
-            expected_run_id=verify.current_run_id,
+            expected_run_id=build.current_run_id,
         )
-        review_result = supervise_goal_once(
+        waiting = supervise_goal_once(
             conn,
             created.goal_id,
             board="default",
             runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
         )
-        assert review_result.action == "CREATED_SUCCESSOR"
+        waiting_goal = get_durable_goal(conn, created.goal_id)
+        assert waiting.action == "AWAITING_TRUSTED_RESULT"
+        assert waiting.task_id is None
+        assert waiting_goal is not None
+        assert waiting_goal.current_stage == "VERIFY_PROMOTE"
+        assert [
+            task.stage for task in list_durable_goal_tasks(conn, created.goal_id)
+        ] == ["PLAN", "BUILD_CANDIDATE"]
+
+        evidence = PromotionEvidence.create(
+            adapter_id="fixture-adapter",
+            request=PromotionRequest(
+                contract_hash=contract.contract_hash,
+                base_revision=contract.base_revision,
+                scope=contract.scope,
+                gates=contract.gates,
+                candidate_sha=candidate_sha,
+                attempt=0,
+            ),
+            classification=ResultClassification.PASS,
+            summary="deterministic gates passed",
+        )
+        review_result = apply_trusted_stage_result(conn, created.goal_id, evidence)
+        assert review_result.action == "CREATED_REVIEW"
+        assert review_result.task_id is not None
+        goal_at_review = get_durable_goal(conn, created.goal_id)
+        assert goal_at_review is not None
+        assert goal_at_review.promotion_evidence == evidence.as_payload()
         review_task = kb.get_task(conn, review_result.task_id)
         assert review_task is not None
+        assert review_task.assignee == "reviewer"
         assert review_task.skills == ["immutable-change-reviews"]
 
         review = kb.claim_review_task(
@@ -575,14 +625,61 @@ def test_durable_goal_acceptance_chain_delivers_once_without_inbound_replay(
             metadata={
                 "_kanban_dispatch_role": "reviewer",
                 "durable_goal": {
+                    "workflow_version": 2,
                     "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
                     "stage": "REVIEW",
                     "run_id": review.current_run_id,
                     "candidate_sha": candidate_sha,
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "reviewer",
                     "verdict": "APPROVE",
+                    "findings": [],
+                    "reviewer_skill_digest": reviewer_skill_digest,
                 },
             },
             expected_run_id=review.current_run_id,
+        )
+        adjudicate_result = supervise_goal_once(
+            conn,
+            created.goal_id,
+            board="default",
+            runtime_protocol_version=DURABLE_GOAL_PROTOCOL_VERSION,
+        )
+        goal_at_adjudicate = get_durable_goal(conn, created.goal_id)
+        assert adjudicate_result.action == "CREATED_ADJUDICATE"
+        assert adjudicate_result.task_id is not None
+        assert goal_at_adjudicate is not None
+        assert goal_at_adjudicate.current_stage == "ADJUDICATE"
+        assert goal_at_adjudicate.status != "READY_FOR_OWNER"
+        assert list_goal_notifications(conn, created.goal_id) == []
+
+        adjudicate = kb.claim_task(
+            conn, adjudicate_result.task_id, claimer="orchestrator"
+        )
+        assert adjudicate is not None and adjudicate.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            adjudicate.id,
+            summary="candidate ready for owner",
+            metadata={
+                "durable_goal": {
+                    "workflow_version": 2,
+                    "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
+                    "stage": "ADJUDICATE",
+                    "run_id": adjudicate.current_run_id,
+                    "candidate_sha": candidate_sha,
+                    "contract_hash": contract.contract_hash,
+                    "base_revision": contract.base_revision,
+                    "scope": list(contract.scope),
+                    "gates": list(contract.gates),
+                    "authority": "orchestrator",
+                    "decision": "READY_FOR_OWNER",
+                }
+            },
+            expected_run_id=adjudicate.current_run_id,
         )
         ready = supervise_goal_once(
             conn,
@@ -599,20 +696,33 @@ def test_durable_goal_acceptance_chain_delivers_once_without_inbound_replay(
         goal = get_durable_goal(conn, created.goal_id)
         notifications = list_goal_notifications(conn, created.goal_id)
         tasks = list_durable_goal_tasks(conn, created.goal_id)
+        task_records = [kb.get_task(conn, task.task_id) for task in tasks]
 
     assert ready.action == "READY_FOR_OWNER"
     assert ready_replay.action == "NOOP"
     assert inbound_user_messages == []
     assert goal is not None and goal.status == "READY_FOR_OWNER"
     assert [task.stage for task in tasks] == [
-        "BUILD",
-        "REPAIR_BUILD_1",
-        "VERIFY",
+        "PLAN",
+        "BUILD_CANDIDATE",
         "REVIEW",
+        "ADJUDICATE",
     ]
-    assert [notification.kind for notification in notifications] == [
-        "READY_FOR_OWNER"
+    assert all(task is not None for task in task_records)
+    assert [task.assignee for task in task_records if task is not None] == [
+        "orchestrator",
+        "builder",
+        "reviewer",
+        "orchestrator",
     ]
+    assert {task.assignee for task in task_records if task is not None} == {
+        "orchestrator",
+        "builder",
+        "reviewer",
+    }
+    assert all(task.stage != "VERIFY" for task in tasks)
+    assert all(task.assignee != "verifier" for task in task_records if task is not None)
+    assert [notification.kind for notification in notifications] == ["READY_FOR_OWNER"]
 
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
@@ -626,7 +736,7 @@ def test_durable_goal_acceptance_chain_delivers_once_without_inbound_replay(
         assert row["delivery_attempts"] == 1
         assert [
             task.stage for task in list_durable_goal_tasks(conn, created.goal_id)
-        ] == ["BUILD", "REPAIR_BUILD_1", "VERIFY", "REVIEW"]
+        ] == ["PLAN", "BUILD_CANDIDATE", "REVIEW", "ADJUDICATE"]
 
 
 def _unseen_terminal_events(tid):
@@ -680,7 +790,9 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
     assert adapter2.sent == []
 
 
-def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
+def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(
+    tmp_path, monkeypatch
+):
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -845,6 +957,7 @@ class ReportedFailureAdapter:
     async def send(self, chat_id, text, metadata=None):
         self.attempts += 1
         from gateway.platforms.base import SendResult
+
         return SendResult(success=False, error="Not connected")
 
 
@@ -987,7 +1100,10 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
         tid = kb.create_task(conn, title="owned by beta", assignee="worker")
         # Subscription is owned by profile "beta".
         kb.add_notify_sub(
-            conn, task_id=tid, platform="telegram", chat_id="chat-beta",
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-beta",
             notifier_profile="beta",
         )
         kb.complete_task(conn, tid, summary="done")
@@ -1021,7 +1137,9 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     )
     # The claim is rewound (adapter resolved to None → treated as disconnected),
     # so the event is still unseen and will deliver once beta's adapter connects.
-    assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
+    assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == [
+        "completed"
+    ]
 
 
 def test_notifier_claims_platform_only_a_secondary_profile_owns(tmp_path, monkeypatch):
@@ -1050,7 +1168,10 @@ def test_notifier_claims_platform_only_a_secondary_profile_owns(tmp_path, monkey
     try:
         tid = kb.create_task(conn, title="owned by beta on discord", assignee="worker")
         kb.add_notify_sub(
-            conn, task_id=tid, platform="discord", chat_id="chat-beta",
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="chat-beta",
             notifier_profile="beta",
         )
         kb.complete_task(conn, tid, summary="done")
@@ -1229,11 +1350,15 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     conn = kb.connect()
     try:
         tid_bad = kb.create_task(conn, title="bad task", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid_bad, platform="telegram", chat_id="chat-bad")
+        kb.add_notify_sub(
+            conn, task_id=tid_bad, platform="telegram", chat_id="chat-bad"
+        )
         kb.complete_task(conn, tid_bad, summary="done")
 
         tid_good = kb.create_task(conn, title="good task", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid_good, platform="telegram", chat_id="chat-good")
+        kb.add_notify_sub(
+            conn, task_id=tid_good, platform="telegram", chat_id="chat-good"
+        )
         kb.complete_task(conn, tid_good, summary="done")
     finally:
         conn.close()
@@ -1287,9 +1412,15 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
         tid = kb.create_task(conn, title="loops forever", assignee="worker")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb._append_event(
-            conn, tid, "block_loop_detected",
-            {"reason": "needs credentials", "kind": "needs_input",
-             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+            conn,
+            tid,
+            "block_loop_detected",
+            {
+                "reason": "needs credentials",
+                "kind": "needs_input",
+                "recurrences": 2,
+                "limit": kb.BLOCK_RECURRENCE_LIMIT,
+            },
         )
     finally:
         conn.close()
@@ -1308,7 +1439,10 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     conn = kb.connect()
     try:
         _, remaining = kb.unseen_events_for_sub(
-            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
             kinds=["block_loop_detected"],
         )
     finally:

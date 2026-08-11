@@ -32,11 +32,21 @@ def _make_legacy_db(path: Path) -> None:
             PRIMARY KEY (task_id, platform, chat_id, thread_id));
         """
     )
-    conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('task-1', 'T', 'done', 1000)")
-    conn.execute("INSERT INTO task_comments VALUES ('c-1', 'task-1', 'agent', 'hi', 1500)")
-    conn.execute("INSERT INTO task_events VALUES ('e-1', 'task-1', 'completed', NULL, 2000)")
-    conn.execute("INSERT INTO task_events VALUES ('e-2', 'task-1', 'blocked', NULL, 2100)")
-    conn.execute("INSERT INTO task_runs VALUES ('r-1', 'task-1', 'default', 'done', 1000)")
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('task-1', 'T', 'done', 1000)"
+    )
+    conn.execute(
+        "INSERT INTO task_comments VALUES ('c-1', 'task-1', 'agent', 'hi', 1500)"
+    )
+    conn.execute(
+        "INSERT INTO task_events VALUES ('e-1', 'task-1', 'completed', NULL, 2000)"
+    )
+    conn.execute(
+        "INSERT INTO task_events VALUES ('e-2', 'task-1', 'blocked', NULL, 2100)"
+    )
+    conn.execute(
+        "INSERT INTO task_runs VALUES ('r-1', 'task-1', 'default', 'done', 1000)"
+    )
     conn.execute(
         "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at, last_event_id) "
         "VALUES ('task-1', 'telegram', '123', 1000, 'e-1')"
@@ -110,10 +120,14 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
 
     with kb.connect(db_path) as conn:
         for table in ("task_events", "task_comments", "task_runs"):
-            id_col = {r["name"]: r for r in conn.execute(f"PRAGMA table_info({table})")}["id"]
+            id_col = {
+                r["name"]: r for r in conn.execute(f"PRAGMA table_info({table})")
+            }["id"]
             assert id_col["type"].upper() == "INTEGER" and id_col["pk"] == 1
 
-        lei = {r["name"]: r for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
+        lei = {
+            r["name"]: r for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")
+        }
         assert lei["last_event_id"]["type"].upper() == "INTEGER"
         assert "delivery_metadata" in lei
 
@@ -122,17 +136,35 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert conn.execute("SELECT body FROM task_comments").fetchone()["body"] == "hi"
         assert len(conn.execute("SELECT * FROM task_runs").fetchall()) == 1
         # Non-numeric legacy cursor ("e-1") casts to 0.
-        assert conn.execute("SELECT last_event_id FROM kanban_notify_subs").fetchone()["last_event_id"] == 0
+        assert (
+            conn.execute("SELECT last_event_id FROM kanban_notify_subs").fetchone()[
+                "last_event_id"
+            ]
+            == 0
+        )
 
         # Indexes restored, including idx_events_run (added by the additive pass).
-        indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-        for name in ("idx_events_task", "idx_events_run", "idx_comments_task",
-                     "idx_runs_task", "idx_runs_status", "idx_notify_task"):
+        indexes = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+        for name in (
+            "idx_events_task",
+            "idx_events_run",
+            "idx_comments_task",
+            "idx_runs_task",
+            "idx_runs_status",
+            "idx_notify_task",
+        ):
             assert name in indexes
 
         # AUTOINCREMENT actually works after the rebuild.
-        conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('task-1', 'completed', 3000)")
-        new_id = conn.execute("SELECT id FROM task_events ORDER BY id DESC LIMIT 1").fetchone()["id"]
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) VALUES ('task-1', 'completed', 3000)"
+        )
+        new_id = conn.execute(
+            "SELECT id FROM task_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()["id"]
         assert isinstance(new_id, int) and new_id >= 1
 
 
@@ -146,7 +178,12 @@ def test_rebuilt_schema_matches_fresh_db(tmp_path, monkeypatch):
     kb._INITIALIZED_PATHS.discard(str(fresh_path.resolve()))
 
     with kb.connect(legacy_path) as migrated, kb.connect(fresh_path) as fresh:
-        for table in ("task_events", "task_comments", "task_runs", "kanban_notify_subs"):
+        for table in (
+            "task_events",
+            "task_comments",
+            "task_runs",
+            "kanban_notify_subs",
+        ):
             assert _table_struct(migrated, table) == _table_struct(fresh, table)
 
 
@@ -159,7 +196,9 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         pass
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     with kb.connect(db_path) as conn:
-        id_col = {r["name"]: r for r in conn.execute("PRAGMA table_info(task_events)")}["id"]
+        id_col = {r["name"]: r for r in conn.execute("PRAGMA table_info(task_events)")}[
+            "id"
+        ]
         assert id_col["type"].upper() == "INTEGER"
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
 
@@ -176,3 +215,79 @@ def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
         )
         assert isinstance(cursor, int)
         assert isinstance(events, list)
+
+
+def test_v1_durable_goal_schema_migrates_additively_and_preserves_history(
+    tmp_path, monkeypatch
+):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE kanban_goals (
+            id TEXT PRIMARY KEY,
+            objective TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_stage TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            protocol_version INTEGER NOT NULL,
+            board_slug TEXT NOT NULL,
+            origin_platform TEXT NOT NULL,
+            origin_chat_id TEXT NOT NULL,
+            origin_chat_type TEXT,
+            origin_thread_id TEXT NOT NULL DEFAULT '',
+            origin_user_id TEXT,
+            origin_message_id TEXT,
+            notifier_profile TEXT,
+            delivery_metadata TEXT,
+            builder_profile TEXT NOT NULL,
+            verifier_profile TEXT NOT NULL,
+            reviewer_profile TEXT NOT NULL,
+            reviewer_skill_digest TEXT,
+            repair_budget INTEGER NOT NULL,
+            repair_attempts_reserved INTEGER NOT NULL DEFAULT 0,
+            review_retry_budget INTEGER NOT NULL,
+            review_attempts_reserved INTEGER NOT NULL DEFAULT 0,
+            candidate_sha TEXT,
+            blocked_reason TEXT,
+            state_version INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO kanban_goals (
+            id, objective, status, current_stage, schema_version,
+            protocol_version, board_slug, origin_platform, origin_chat_id,
+            builder_profile, verifier_profile, reviewer_profile,
+            repair_budget, review_retry_budget, created_at, updated_at
+        ) VALUES (
+            'g_v1_history', 'history remains readable', 'COMPLETED', 'COMPLETED',
+            1, 1, 'legacy', 'telegram', 'owner', 'builder', 'verifier',
+            'reviewer', 1, 1, 100, 200
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        columns = {
+            row["name"] for row in migrated.execute("PRAGMA table_info(kanban_goals)")
+        }
+        row = migrated.execute(
+            "SELECT * FROM kanban_goals WHERE id = 'g_v1_history'"
+        ).fetchone()
+
+    assert {
+        "workflow_version",
+        "task_contract_ref",
+        "task_contract_json",
+        "task_contract_hash",
+        "resolver_id",
+        "orchestrator_profile",
+        "verify_promote_adapter_id",
+        "promotion_evidence",
+    } <= columns
+    assert row is not None
+    assert row["workflow_version"] == 1
+    assert row["verifier_profile"] == "verifier"
+    assert row["status"] == "COMPLETED"
