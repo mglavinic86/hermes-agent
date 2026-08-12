@@ -222,6 +222,16 @@ class PromotionRequest:
     gates: tuple[str, ...]
     candidate_sha: str
     attempt: int
+    operation_id: str | None = None
+    request_hash: str | None = None
+    contract_version: int | None = None
+    candidate_tree: str | None = None
+    branch_identity: str | None = None
+    pr_identity: str | None = None
+    remote_base: str | None = None
+    remote_head: str | None = None
+    remote_tree: str | None = None
+    gate_evidence: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -236,6 +246,16 @@ class PromotionEvidence:
     classification: ResultClassification
     summary: str
     evidence_hash: str
+    operation_id: str | None = None
+    request_hash: str | None = None
+    contract_version: int | None = None
+    candidate_tree: str | None = None
+    branch_identity: str | None = None
+    pr_identity: str | None = None
+    remote_base: str | None = None
+    remote_head: str | None = None
+    remote_tree: str | None = None
+    gate_evidence: Mapping[str, Any] | None = None
 
     @classmethod
     def create(
@@ -264,6 +284,19 @@ class PromotionEvidence:
             "scope": list(request.scope),
             "summary": normalized_summary,
         }
+        extended = {
+            "branch_identity": request.branch_identity,
+            "candidate_tree": request.candidate_tree,
+            "contract_version": request.contract_version,
+            "gate_evidence": request.gate_evidence,
+            "operation_id": request.operation_id,
+            "pr_identity": request.pr_identity,
+            "remote_base": request.remote_base,
+            "remote_head": request.remote_head,
+            "remote_tree": request.remote_tree,
+            "request_hash": request.request_hash,
+        }
+        payload.update({key: value for key, value in extended.items() if value is not None})
         digest = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -278,10 +311,24 @@ class PromotionEvidence:
             classification=normalized_classification,
             summary=normalized_summary,
             evidence_hash=digest,
+            operation_id=request.operation_id,
+            request_hash=request.request_hash,
+            contract_version=request.contract_version,
+            candidate_tree=request.candidate_tree,
+            branch_identity=request.branch_identity,
+            pr_identity=request.pr_identity,
+            remote_base=request.remote_base,
+            remote_head=request.remote_head,
+            remote_tree=request.remote_tree,
+            gate_evidence=(
+                dict(request.gate_evidence)
+                if request.gate_evidence is not None
+                else None
+            ),
         )
 
     def as_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "adapter_id": self.adapter_id,
             "attempt": self.attempt,
             "base_revision": self.base_revision,
@@ -293,10 +340,26 @@ class PromotionEvidence:
             "scope": list(self.scope),
             "summary": self.summary,
         }
+        for key in (
+            "branch_identity",
+            "candidate_tree",
+            "contract_version",
+            "gate_evidence",
+            "operation_id",
+            "pr_identity",
+            "remote_base",
+            "remote_head",
+            "remote_tree",
+            "request_hash",
+        ):
+            value = getattr(self, key, None)
+            if value is not None:
+                payload[key] = value
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "PromotionEvidence":
-        expected_keys = {
+        base_keys = {
             "adapter_id",
             "attempt",
             "base_revision",
@@ -308,14 +371,44 @@ class PromotionEvidence:
             "scope",
             "summary",
         }
+        extended_keys = {
+            "branch_identity",
+            "candidate_tree",
+            "contract_version",
+            "gate_evidence",
+            "operation_id",
+            "pr_identity",
+            "remote_base",
+            "remote_head",
+            "remote_tree",
+            "request_hash",
+        }
+        expected_keys = base_keys | (extended_keys & set(payload))
         if set(payload) != expected_keys:
             raise ValueError("promotion evidence payload is not canonical")
         string_fields: dict[str, str] = {}
-        for key in expected_keys - {"attempt", "gates", "scope"}:
+        for key in base_keys - {"attempt", "gates", "scope"}:
             value = payload[key]
             if not isinstance(value, str) or not value or value != value.strip():
                 raise ValueError(f"promotion evidence {key} is not canonical")
             string_fields[key] = value
+        optional_strings: dict[str, str | None] = {}
+        for key in extended_keys - {"contract_version", "gate_evidence"}:
+            value = payload.get(key)
+            if value is None:
+                optional_strings[key] = None
+            elif not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(f"promotion evidence {key} is not canonical")
+            else:
+                optional_strings[key] = value
+        contract_version = payload.get("contract_version")
+        if contract_version is not None and (
+            type(contract_version) is not int or contract_version < 1
+        ):
+            raise ValueError("promotion evidence contract_version is not canonical")
+        gate_evidence = payload.get("gate_evidence")
+        if gate_evidence is not None and not isinstance(gate_evidence, Mapping):
+            raise ValueError("promotion evidence gate_evidence is not canonical")
         attempt = payload["attempt"]
         if type(attempt) is not int or attempt < 0:
             raise ValueError("promotion evidence attempt is not canonical")
@@ -339,6 +432,16 @@ class PromotionEvidence:
             classification=ResultClassification(string_fields["classification"]),
             summary=string_fields["summary"],
             evidence_hash=string_fields["evidence_hash"],
+            operation_id=optional_strings["operation_id"],
+            request_hash=optional_strings["request_hash"],
+            contract_version=contract_version,
+            candidate_tree=optional_strings["candidate_tree"],
+            branch_identity=optional_strings["branch_identity"],
+            pr_identity=optional_strings["pr_identity"],
+            remote_base=optional_strings["remote_base"],
+            remote_head=optional_strings["remote_head"],
+            remote_tree=optional_strings["remote_tree"],
+            gate_evidence=dict(gate_evidence) if gate_evidence is not None else None,
         )
         if not evidence.verify_hash():
             raise ValueError("promotion evidence hash does not match its payload")
@@ -354,6 +457,16 @@ class PromotionEvidence:
                 gates=self.gates,
                 candidate_sha=self.candidate_sha,
                 attempt=self.attempt,
+                operation_id=getattr(self, "operation_id", None),
+                request_hash=getattr(self, "request_hash", None),
+                contract_version=getattr(self, "contract_version", None),
+                candidate_tree=getattr(self, "candidate_tree", None),
+                branch_identity=getattr(self, "branch_identity", None),
+                pr_identity=getattr(self, "pr_identity", None),
+                remote_base=getattr(self, "remote_base", None),
+                remote_head=getattr(self, "remote_head", None),
+                remote_tree=getattr(self, "remote_tree", None),
+                gate_evidence=getattr(self, "gate_evidence", None),
             ),
             classification=self.classification,
             summary=self.summary,

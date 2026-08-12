@@ -69,7 +69,65 @@ there are no `BLOCKER` or `MAJOR` findings, and no human gate is requested.
 builder. `HUMAN_GATE` terminalizes safely and enqueues one logical owner
 notification.
 
+## Durable Verify/Promote Operations
+
+`VERIFY_PROMOTE` is a durable taskless operation, not an LLM authority. When
+`BUILD_CANDIDATE` or `REPAIR_BUILD_n` completes, the same SQLite
+`BEGIN IMMEDIATE` transition that moves the goal into `VERIFY_PROMOTE` also
+creates or reuses exactly one `kanban_goal_operations` row for
+`(goal_id, "VERIFY_PROMOTE", stage_attempt)`. The `operation_id` is stable for
+that tuple, and the operation stores a canonical request payload plus
+`request_hash`.
+
+The request hash binds the static adapter id, task contract hash/version,
+expected base revision, candidate SHA/tree, branch identity, PR identity,
+remote base/head/tree, and deterministic gate evidence. Builder evidence must
+provide every field canonically: remote base equals the contract base SHA,
+remote head equals the candidate SHA, and remote tree equals the candidate
+tree. Missing or foreign readback fields fail closed before an operation row is
+created; no identity or tree is fabricated.
+
+Gateway board ticks claim at most one due `PENDING` or `RETRYABLE` operation,
+or one expired `CLAIMED` lease, using a CAS on operation id, state,
+`request_hash`, and lease. Adapter lookup is only by static
+`TrustedStageRegistry` ID. The generic executor does not run shell commands,
+dynamic imports, arbitrary URLs, `gh`, or model-provided executable payloads.
+Adapter execution happens after the claim transaction commits. Ack re-reads the
+operation, goal, contract, request, claim token, unexpired lease, and every
+authoritative result field inside a fresh `BEGIN IMMEDIATE` transaction. The
+final ack UPDATE repeats the token, request-hash, state, and unexpired-lease CAS,
+so stale or expired claimants and foreign/replayed responses cannot write
+results. `RETRYABLE` keeps the same operation identity and uses attempt-based
+capped exponential backoff.
+
+Trusted adapter execution is bounded by
+`kanban.trusted_operation_timeout_seconds` (default 120 seconds, clamped below
+the operation lease). A missed deadline returns control to the singleton
+dispatcher without acknowledging the claim. The stable operation remains
+replayable after lease expiry, and a late daemon-thread result has no database
+connection or claim-ack path.
+
+When the supervisor consumes terminal operation evidence, the successor or
+human-gate write transaction re-reads the exact operation snapshot, recomputes
+the canonical request and response hashes, verifies the evidence digest and
+complete request/response relationship, and checks terminal state against the
+classification. A response changed or re-signed before or after initial
+validation is not consumed, closing both persisted-evidence forgery and
+terminal check/use races.
+
+Malformed, unknown, or request-mismatched adapter results fail closed as a
+canonical `HARD_BLOCK` response. The operation becomes `BLOCKED`, the
+supervisor terminalizes the goal to a human gate, and the owner outbox uses its
+logical dedupe key so replay does not create duplicate notifications.
+
 ## Rollout And Migration
+
+Durable operation storage is schema version 3 while the authority workflow and
+trusted evidence protocol remain version 2. This distinguishes operation-aware
+gateways from the earlier Workflow V2 runtime, which could enter taskless
+`VERIFY_PROMOTE` without creating an operation row. An active schema-2 goal
+observed by a schema-3 supervisor fails closed once to a human gate with one
+logical owner notification; it is never silently reconstructed.
 
 Every gateway instance that can acquire the machine-wide Kanban dispatcher lock
 must be upgraded before trusted V2 durable goals are enabled. Creation checks a

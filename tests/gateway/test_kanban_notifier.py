@@ -11,7 +11,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_goal_supervisor import (
     DURABLE_GOAL_PROTOCOL_VERSION,
     GoalOrigin,
-    apply_trusted_stage_result,
+    _apply_trusted_stage_result,
     create_trusted_durable_goal,
     get_durable_goal,
     list_durable_goal_tasks,
@@ -566,6 +566,16 @@ def test_durable_goal_acceptance_chain_delivers_once_without_inbound_replay(
                     "stage": "BUILD_CANDIDATE",
                     "run_id": build.current_run_id,
                     "candidate_sha": candidate_sha,
+                    "candidate_tree": "c" * 40,
+                    "branch_identity": "turpi/notifier-acceptance",
+                    "pr_identity": "pr-notifier-acceptance",
+                    "remote_base": contract.base_revision,
+                    "remote_head": candidate_sha,
+                    "remote_tree": "c" * 40,
+                    "deterministic_gate_evidence": {
+                        "focused-test": "passed",
+                        "no-remote-writes": "passed",
+                    },
                     "contract_hash": contract.contract_hash,
                     "base_revision": contract.base_revision,
                     "scope": list(contract.scope),
@@ -603,7 +613,7 @@ def test_durable_goal_acceptance_chain_delivers_once_without_inbound_replay(
             classification=ResultClassification.PASS,
             summary="deterministic gates passed",
         )
-        review_result = apply_trusted_stage_result(conn, created.goal_id, evidence)
+        review_result = _apply_trusted_stage_result(conn, created.goal_id, evidence)
         assert review_result.action == "CREATED_REVIEW"
         assert review_result.task_id is not None
         goal_at_review = get_durable_goal(conn, created.goal_id)

@@ -19,7 +19,7 @@ from hermes_cli.kanban_goal_supervisor import (
     DURABLE_GOAL_PROTOCOL_VERSION,
     DURABLE_GOAL_SCHEMA_VERSION,
     GoalOrigin,
-    apply_trusted_stage_result,
+    _apply_trusted_stage_result,
     create_durable_goal,
     create_trusted_durable_goal,
     get_durable_goal,
@@ -75,6 +75,19 @@ def _complete_bound_task(
         else kb.claim_task(conn, task_id, claimer=profile)
     )
     assert task is not None and task.current_run_id is not None
+    durable_fields = dict(fields)
+    if stage == "BUILD_CANDIDATE" or stage.startswith("REPAIR_BUILD_"):
+        candidate_sha = str(durable_fields.get("candidate_sha") or "").strip().lower()
+        if candidate_sha:
+            durable_fields.setdefault("candidate_tree", candidate_sha)
+            durable_fields.setdefault("branch_identity", f"turpi/{candidate_sha[:12]}")
+            durable_fields.setdefault("pr_identity", f"pr-{candidate_sha[:12]}")
+            durable_fields.setdefault("remote_base", contract.base_revision)
+            durable_fields.setdefault("remote_head", candidate_sha)
+            durable_fields.setdefault("remote_tree", durable_fields["candidate_tree"])
+            durable_fields.setdefault(
+                "deterministic_gate_evidence", {"focused-tests": "passed"}
+            )
     payload = {
         "workflow_version": 2,
         "protocol_version": DURABLE_GOAL_PROTOCOL_VERSION,
@@ -85,7 +98,7 @@ def _complete_bound_task(
         "scope": list(contract.scope),
         "gates": list(contract.gates),
         "authority": profile,
-        **fields,
+        **durable_fields,
     }
     assert kb.complete_task(
         conn,
@@ -164,7 +177,7 @@ def _create_goal_at_review(
         classification=ResultClassification.PASS,
         summary="deterministic gates passed",
     )
-    review_id = apply_trusted_stage_result(conn, created.goal_id, evidence).task_id
+    review_id = _apply_trusted_stage_result(conn, created.goal_id, evidence).task_id
     assert review_id is not None
     return created, review_id
 
@@ -612,7 +625,7 @@ def test_v2_creation_binds_contract_and_starts_one_orchestrator_plan_task(
         task = kb.get_task(conn, created.task_id)
         bindings = list_durable_goal_tasks(conn, created.goal_id)
 
-    assert DURABLE_GOAL_SCHEMA_VERSION == 2
+    assert DURABLE_GOAL_SCHEMA_VERSION == 3
     assert DURABLE_GOAL_PROTOCOL_VERSION == 2
     assert goal is not None
     assert goal.workflow_version == 2
@@ -843,7 +856,7 @@ def test_injected_pass_evidence_creates_review_for_reviewer(tmp_path, monkeypatc
             summary="all deterministic gates passed",
         )
 
-        result = apply_trusted_stage_result(conn, created.goal_id, evidence)
+        result = _apply_trusted_stage_result(conn, created.goal_id, evidence)
         goal = get_durable_goal(conn, created.goal_id)
         review = kb.get_task(conn, result.task_id) if result.task_id else None
         bindings = list_durable_goal_tasks(conn, created.goal_id)
@@ -893,7 +906,7 @@ def test_repairable_failure_creates_adjudicate_for_orchestrator(tmp_path, monkey
             summary="a bounded repair may satisfy the contract",
         )
 
-        result = apply_trusted_stage_result(conn, created.goal_id, evidence)
+        result = _apply_trusted_stage_result(conn, created.goal_id, evidence)
         goal = get_durable_goal(conn, created.goal_id)
         adjudicate = kb.get_task(conn, result.task_id) if result.task_id else None
         bindings = list_durable_goal_tasks(conn, created.goal_id)
@@ -943,8 +956,8 @@ def test_hard_block_evidence_routes_once_to_human_gate_without_llm_task(
             summary="deterministic policy gate cannot be repaired",
         )
 
-        first = apply_trusted_stage_result(conn, created.goal_id, evidence)
-        replay = apply_trusted_stage_result(conn, created.goal_id, evidence)
+        first = _apply_trusted_stage_result(conn, created.goal_id, evidence)
+        replay = _apply_trusted_stage_result(conn, created.goal_id, evidence)
         goal = get_durable_goal(conn, created.goal_id)
         bindings = list_durable_goal_tasks(conn, created.goal_id)
         notifications = list_goal_notifications(conn, created.goal_id)
@@ -991,7 +1004,7 @@ def test_retryable_evidence_stays_non_llm_and_creates_no_task(tmp_path, monkeypa
             summary="trusted service is temporarily unavailable",
         )
 
-        result = apply_trusted_stage_result(conn, created.goal_id, evidence)
+        result = _apply_trusted_stage_result(conn, created.goal_id, evidence)
         goal = get_durable_goal(conn, created.goal_id)
         after = list_durable_goal_tasks(conn, created.goal_id)
 
@@ -1898,7 +1911,7 @@ def test_retryable_evidence_keeps_same_taskless_verify_promote_state(
             summary="temporary deterministic service outage",
         )
 
-        result = apply_trusted_stage_result(conn, created.goal_id, evidence)
+        result = _apply_trusted_stage_result(conn, created.goal_id, evidence)
         goal = get_durable_goal(conn, created.goal_id)
         after = list_durable_goal_tasks(conn, created.goal_id)
 

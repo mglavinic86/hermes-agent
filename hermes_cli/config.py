@@ -3144,6 +3144,10 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Maximum wall-clock time for one trusted VERIFY_PROMOTE adapter call.
+        # The gateway clamps this below the operation lease so a wedged adapter
+        # cannot monopolize the singleton dispatcher or acknowledge late.
+        "trusted_operation_timeout_seconds": 120,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

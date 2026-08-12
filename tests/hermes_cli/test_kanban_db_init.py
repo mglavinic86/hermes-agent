@@ -273,6 +273,10 @@ def test_v1_durable_goal_schema_migrates_additively_and_preserves_history(
         columns = {
             row["name"] for row in migrated.execute("PRAGMA table_info(kanban_goals)")
         }
+        operation_columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(kanban_goal_operations)")
+        }
         row = migrated.execute(
             "SELECT * FROM kanban_goals WHERE id = 'g_v1_history'"
         ).fetchone()
@@ -291,3 +295,23 @@ def test_v1_durable_goal_schema_migrates_additively_and_preserves_history(
     assert row["workflow_version"] == 1
     assert row["verifier_profile"] == "verifier"
     assert row["status"] == "COMPLETED"
+    assert {
+        "operation_id",
+        "goal_id",
+        "kind",
+        "stage_attempt",
+        "request_hash",
+        "request_payload",
+        "state",
+        "claim_token",
+        "claimed_at",
+        "lease_expires_at",
+        "attempt_count",
+        "next_attempt_at",
+        "response_hash",
+        "response_payload",
+        "last_error",
+        "created_at",
+        "updated_at",
+        "completed_at",
+    } <= operation_columns
