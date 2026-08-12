@@ -262,13 +262,15 @@ def execute_due_operation_once(
     *,
     registry: Optional[TrustedStageRegistry] = None,
     now: Optional[int] = None,
+    clock: Callable[[], int] | None = None,
     token_factory: Callable[[], str] | None = None,
     lease_seconds: int = 300,
 ) -> Optional[GoalOperation]:
-    current_time = int(time.time()) if now is None else int(now)
+    selected_clock = clock or time.time
+    claim_time = int(selected_clock()) if now is None else int(now)
     token = token_factory() if token_factory is not None else secrets.token_urlsafe(24)
     operation = claim_due_operation(
-        conn, now=current_time, lease_seconds=lease_seconds, claim_token=token
+        conn, now=claim_time, lease_seconds=lease_seconds, claim_token=token
     )
     if operation is None:
         return None
@@ -288,7 +290,10 @@ def execute_due_operation_once(
         claim_token=operation.claim_token or token,
         request_hash=operation.request_hash,
         response_payload=response_payload,
-        now=current_time,
+        # Re-read real time after adapter execution so an expired claimant
+        # cannot acknowledge with the earlier claim timestamp.  Explicit
+        # ``now`` remains a deterministic single-instant test seam.
+        now=int(selected_clock()) if now is None else int(now),
     )
     return _operation_from_row(row) if row is not None else None
 

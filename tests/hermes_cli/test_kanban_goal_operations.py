@@ -507,6 +507,46 @@ class _PassAdapter:
         )
 
 
+class _LeaseExpiringAdapter:
+    adapter_id = "fixture-adapter"
+
+    def classify(self, request: PromotionRequest) -> PromotionEvidence:
+        return PromotionEvidence.create(
+            adapter_id=self.adapter_id,
+            request=request,
+            classification=ResultClassification.PASS,
+            summary="completed after lease expiry",
+        )
+
+
+def test_executor_rechecks_clock_before_ack_and_rejects_expired_claim(
+    tmp_path, monkeypatch
+):
+    _setup_home(tmp_path, monkeypatch)
+    ticks = iter((100, 102))
+    registry = TrustedStageRegistry(
+        resolvers={}, adapters={"fixture-adapter": _LeaseExpiringAdapter()}
+    )
+    with kb.connect() as conn:
+        created, _contract = _create_waiting_operation(conn)
+        result = execute_due_operation_once(
+            conn,
+            registry=registry,
+            clock=lambda: next(ticks),
+            lease_seconds=1,
+            token_factory=lambda: "expired-claim",
+        )
+        row = conn.execute(
+            "SELECT * FROM kanban_goal_operations WHERE goal_id = ?",
+            (created.goal_id,),
+        ).fetchone()
+
+    assert result is None
+    assert row is not None
+    assert row["state"] == OperationState.CLAIMED.value
+    assert row["response_payload"] is None
+
+
 class _SequenceAdapter:
     adapter_id = "fixture-adapter"
 
