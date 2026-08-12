@@ -34,18 +34,31 @@ class AdapterExecutionTimeout(TimeoutError):
     """Raised when a trusted adapter misses its bounded execution deadline."""
 
 
-_ADAPTER_GATES_LOCK = threading.Lock()
-_ADAPTER_GATES: dict[str, threading.BoundedSemaphore] = {}
+_OPERATION_GATES_LOCK = threading.Lock()
+_OPERATION_GATES: dict[str, threading.BoundedSemaphore] = {}
 
 
-def _adapter_gate(adapter_id: str) -> threading.BoundedSemaphore:
-    """Allow at most one live worker per static adapter ID.
+def _operation_gate(operation_id: str) -> threading.BoundedSemaphore:
+    """Allow at most one live worker per durable operation.
 
     A timed-out daemon thread may be uncooperative, so later replay attempts
-    must not create an unbounded thread leak while it is still running.
+    for the same stable operation must not create an unbounded thread leak.
+    Unrelated operations remain isolated even when they share an adapter ID.
     """
-    with _ADAPTER_GATES_LOCK:
-        return _ADAPTER_GATES.setdefault(adapter_id, threading.BoundedSemaphore(1))
+    with _OPERATION_GATES_LOCK:
+        return _OPERATION_GATES.setdefault(
+            operation_id, threading.BoundedSemaphore(1)
+        )
+
+
+def _release_operation_gate(
+    operation_id: str, gate: threading.BoundedSemaphore
+) -> None:
+    """Release and retire a completed operation gate without replacement races."""
+    with _OPERATION_GATES_LOCK:
+        gate.release()
+        if _OPERATION_GATES.get(operation_id) is gate:
+            _OPERATION_GATES.pop(operation_id, None)
 
 
 @dataclass(frozen=True)
@@ -305,10 +318,11 @@ def execute_due_operation_once(
     adapter_id = str(operation.request_payload.get("adapter_id") or "")
     try:
         adapter = selected_registry.adapter(adapter_id)
-        gate = _adapter_gate(adapter_id)
-        if not gate.acquire(timeout=timeout_seconds):
+        gate = _operation_gate(operation.operation_id)
+        if not gate.acquire(blocking=False):
             raise AdapterExecutionTimeout(
-                f"trusted adapter {adapter_id!r} is still running after a prior deadline"
+                f"trusted operation {operation.operation_id!r} is still running "
+                "after a prior deadline"
             )
         outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
 
@@ -318,7 +332,7 @@ def execute_due_operation_once(
             except BaseException as exc:
                 outcome.put((False, exc))
             finally:
-                gate.release()
+                _release_operation_gate(operation.operation_id, gate)
 
         worker = threading.Thread(
             target=_classify,

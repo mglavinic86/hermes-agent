@@ -554,8 +554,10 @@ class _NeverReturningAdapter:
 
     def __init__(self, release: threading.Event) -> None:
         self.release = release
+        self.calls = 0
 
     def classify(self, request: PromotionRequest) -> PromotionEvidence:
+        self.calls += 1
         self.release.wait()
         return PromotionEvidence.create(
             adapter_id=self.adapter_id,
@@ -598,6 +600,102 @@ def test_executor_deadline_returns_without_waiting_for_wedged_adapter(
     assert row is not None
     assert row["state"] == OperationState.CLAIMED.value
     assert row["response_payload"] is None
+
+
+def test_wedged_operation_does_not_starve_healthy_operation_with_same_adapter_id(
+    tmp_path, monkeypatch
+):
+    _setup_home(tmp_path, monkeypatch)
+    release = threading.Event()
+    wedged_registry = TrustedStageRegistry(
+        resolvers={},
+        adapters={"fixture-adapter": _NeverReturningAdapter(release)},
+    )
+    healthy = _PassAdapter()
+    healthy_registry = TrustedStageRegistry(
+        resolvers={}, adapters={"fixture-adapter": healthy}
+    )
+    try:
+        with kb.connect() as conn:
+            first, _first_contract = _create_waiting_operation(
+                conn, candidate_sha="4" * 40
+            )
+            second, _second_contract = _create_waiting_operation(
+                conn, candidate_sha="5" * 40
+            )
+            assert (
+                execute_due_operation_once(
+                    conn,
+                    registry=wedged_registry,
+                    now=100,
+                    adapter_timeout_seconds=0.05,
+                    token_factory=lambda: "wedged-claim",
+                )
+                is None
+            )
+            completed = execute_due_operation_once(
+                conn,
+                registry=healthy_registry,
+                now=100,
+                adapter_timeout_seconds=0.05,
+                token_factory=lambda: "healthy-claim",
+            )
+            wedged_row = conn.execute(
+                "SELECT * FROM kanban_goal_operations WHERE claim_token = ?",
+                ("wedged-claim",),
+            ).fetchone()
+            completed_row = conn.execute(
+                "SELECT * FROM kanban_goal_operations WHERE operation_id = ?",
+                (completed.operation_id if completed is not None else "",),
+            ).fetchone()
+    finally:
+        release.set()
+
+    assert healthy.calls == 1
+    assert completed is not None
+    assert completed.state == OperationState.SUCCEEDED
+    assert wedged_row is not None
+    assert wedged_row["state"] == OperationState.CLAIMED.value
+    assert completed.operation_id != wedged_row["operation_id"]
+    assert completed_row is not None
+    assert completed_row["state"] == OperationState.SUCCEEDED.value
+
+
+def test_replayed_wedged_operation_does_not_spawn_another_worker(tmp_path, monkeypatch):
+    _setup_home(tmp_path, monkeypatch)
+    release = threading.Event()
+    adapter = _NeverReturningAdapter(release)
+    registry = TrustedStageRegistry(
+        resolvers={}, adapters={"fixture-adapter": adapter}
+    )
+    try:
+        with kb.connect() as conn:
+            _created, _contract = _create_waiting_operation(conn)
+            first = execute_due_operation_once(
+                conn,
+                registry=registry,
+                now=100,
+                lease_seconds=1,
+                adapter_timeout_seconds=0.05,
+                token_factory=lambda: "claim-one",
+            )
+            started = time.monotonic()
+            replay = execute_due_operation_once(
+                conn,
+                registry=registry,
+                now=101,
+                lease_seconds=1,
+                adapter_timeout_seconds=0.2,
+                token_factory=lambda: "claim-two",
+            )
+            replay_elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert first is None
+    assert replay is None
+    assert replay_elapsed < 0.1
+    assert adapter.calls == 1
 
 
 class _SequenceAdapter:
