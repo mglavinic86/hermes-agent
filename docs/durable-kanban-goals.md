@@ -100,6 +100,13 @@ so stale or expired claimants and foreign/replayed responses cannot write
 results. `RETRYABLE` keeps the same operation identity and uses attempt-based
 capped exponential backoff.
 
+Trusted adapter execution is bounded by
+`kanban.trusted_operation_timeout_seconds` (default 120 seconds, clamped below
+the operation lease). A missed deadline returns control to the singleton
+dispatcher without acknowledging the claim. The stable operation remains
+replayable after lease expiry, and a late daemon-thread result has no database
+connection or claim-ack path.
+
 When the supervisor consumes terminal operation evidence, the successor or
 human-gate write transaction re-reads the exact operation snapshot, recomputes
 the canonical request and response hashes, verifies the evidence digest and

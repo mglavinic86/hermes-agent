@@ -36,6 +36,7 @@ def _prepare_durable_goal_board_tick(
     registry=None,
     clock: Callable[[], int] | None = None,
     token_factory: Callable[[], str] | None = None,
+    adapter_timeout_seconds: float | None = None,
 ):
     """Stamp singleton compatibility, then advance terminal goal events once."""
     from hermes_cli import kanban_db as _kb
@@ -59,6 +60,8 @@ def _prepare_durable_goal_board_tick(
         registry=registry,
         clock=clock,
         token_factory=token_factory,
+        lease_seconds=lease_seconds,
+        adapter_timeout_seconds=adapter_timeout_seconds,
     )
     return supervise_board_once(
         conn,
@@ -1207,6 +1210,22 @@ class GatewayKanbanWatchersMixin:
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
         durable_runtime_id = f"{os.getpid()}:{secrets.token_hex(12)}"
         durable_runtime_lease_seconds = max(30, int(interval * 3))
+        raw_operation_timeout = kanban_cfg.get("trusted_operation_timeout_seconds", 120)
+        try:
+            durable_operation_timeout_seconds = float(raw_operation_timeout)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid trusted_operation_timeout_seconds=%r, using 120",
+                raw_operation_timeout,
+            )
+            durable_operation_timeout_seconds = 120.0
+        durable_operation_timeout_seconds = max(
+            0.1,
+            min(
+                durable_operation_timeout_seconds,
+                float(durable_runtime_lease_seconds) - 1.0,
+            ),
+        )
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
@@ -1404,6 +1423,7 @@ class GatewayKanbanWatchersMixin:
                     board=slug,
                     runtime_id=durable_runtime_id,
                     lease_seconds=durable_runtime_lease_seconds,
+                    adapter_timeout_seconds=durable_operation_timeout_seconds,
                 )
 
                 return _kb.dispatch_once(

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
@@ -541,6 +543,57 @@ def test_executor_rechecks_clock_before_ack_and_rejects_expired_claim(
             (created.goal_id,),
         ).fetchone()
 
+    assert result is None
+    assert row is not None
+    assert row["state"] == OperationState.CLAIMED.value
+    assert row["response_payload"] is None
+
+
+class _NeverReturningAdapter:
+    adapter_id = "fixture-adapter"
+
+    def __init__(self, release: threading.Event) -> None:
+        self.release = release
+
+    def classify(self, request: PromotionRequest) -> PromotionEvidence:
+        self.release.wait()
+        return PromotionEvidence.create(
+            adapter_id=self.adapter_id,
+            request=request,
+            classification=ResultClassification.PASS,
+            summary="released after caller deadline",
+        )
+
+
+def test_executor_deadline_returns_without_waiting_for_wedged_adapter(
+    tmp_path, monkeypatch
+):
+    _setup_home(tmp_path, monkeypatch)
+    release = threading.Event()
+    registry = TrustedStageRegistry(
+        resolvers={},
+        adapters={"fixture-adapter": _NeverReturningAdapter(release)},
+    )
+    try:
+        with kb.connect() as conn:
+            created, _contract = _create_waiting_operation(conn)
+            started = time.monotonic()
+            result = execute_due_operation_once(
+                conn,
+                registry=registry,
+                now=100,
+                adapter_timeout_seconds=0.05,
+                token_factory=lambda: "wedged-claim",
+            )
+            elapsed = time.monotonic() - started
+            row = conn.execute(
+                "SELECT * FROM kanban_goal_operations WHERE goal_id = ?",
+                (created.goal_id,),
+            ).fetchone()
+    finally:
+        release.set()
+
+    assert elapsed < 0.5
     assert result is None
     assert row is not None
     assert row["state"] == OperationState.CLAIMED.value

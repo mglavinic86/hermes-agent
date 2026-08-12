@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, Optional, cast
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_trusted_stages import (
@@ -26,6 +28,24 @@ class OperationState(str, Enum):
     RETRYABLE = "RETRYABLE"
     SUCCEEDED = "SUCCEEDED"
     BLOCKED = "BLOCKED"
+
+
+class AdapterExecutionTimeout(TimeoutError):
+    """Raised when a trusted adapter misses its bounded execution deadline."""
+
+
+_ADAPTER_GATES_LOCK = threading.Lock()
+_ADAPTER_GATES: dict[str, threading.BoundedSemaphore] = {}
+
+
+def _adapter_gate(adapter_id: str) -> threading.BoundedSemaphore:
+    """Allow at most one live worker per static adapter ID.
+
+    A timed-out daemon thread may be uncooperative, so later replay attempts
+    must not create an unbounded thread leak while it is still running.
+    """
+    with _ADAPTER_GATES_LOCK:
+        return _ADAPTER_GATES.setdefault(adapter_id, threading.BoundedSemaphore(1))
 
 
 @dataclass(frozen=True)
@@ -265,6 +285,7 @@ def execute_due_operation_once(
     clock: Callable[[], int] | None = None,
     token_factory: Callable[[], str] | None = None,
     lease_seconds: int = 300,
+    adapter_timeout_seconds: float | None = None,
 ) -> Optional[GoalOperation]:
     selected_clock = clock or time.time
     claim_time = int(selected_clock()) if now is None else int(now)
@@ -276,11 +297,55 @@ def execute_due_operation_once(
         return None
 
     selected_registry = registry or get_trusted_stage_registry()
+    timeout_seconds = (
+        min(120.0, max(0.001, float(lease_seconds) - 1.0))
+        if adapter_timeout_seconds is None
+        else max(0.001, float(adapter_timeout_seconds))
+    )
     adapter_id = str(operation.request_payload.get("adapter_id") or "")
     try:
         adapter = selected_registry.adapter(adapter_id)
-        evidence = adapter.classify(_request_from_operation(operation))
+        gate = _adapter_gate(adapter_id)
+        if not gate.acquire(timeout=timeout_seconds):
+            raise AdapterExecutionTimeout(
+                f"trusted adapter {adapter_id!r} is still running after a prior deadline"
+            )
+        outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+        def _classify() -> None:
+            try:
+                outcome.put((True, adapter.classify(_request_from_operation(operation))))
+            except BaseException as exc:
+                outcome.put((False, exc))
+            finally:
+                gate.release()
+
+        worker = threading.Thread(
+            target=_classify,
+            name=f"trusted-operation-{operation.operation_id[:12]}",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            succeeded, value = outcome.get(timeout=timeout_seconds)
+        except queue.Empty as exc:
+            # The adapter may still finish in its daemon thread, but only this
+            # caller owns the SQLite claim and only this caller can ack.  By
+            # returning without an ack, the stable operation becomes replayable
+            # after lease expiry while the singleton dispatcher keeps moving.
+            raise AdapterExecutionTimeout(
+                f"trusted adapter exceeded {timeout_seconds:g}s deadline"
+            ) from exc
+        if not succeeded:
+            if isinstance(value, BaseException):
+                raise value
+            raise RuntimeError("trusted adapter failed without an exception")
+        if not isinstance(value, PromotionEvidence):
+            raise TypeError("trusted adapter returned invalid evidence type")
+        evidence = cast(PromotionEvidence, value)
         response_payload = _validate_response_payload(operation, evidence.as_payload())
+    except AdapterExecutionTimeout:
+        return None
     except Exception as exc:
         response_payload = _hard_block_payload(operation, f"trusted adapter failed closed: {exc}")
 
@@ -299,6 +364,7 @@ def execute_due_operation_once(
 
 
 __all__ = [
+    "AdapterExecutionTimeout",
     "GoalOperation",
     "OperationState",
     "claim_due_operation",
