@@ -10,6 +10,7 @@ import time
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_goal_operations as goal_operations
 from hermes_cli import kanban_goal_supervisor as supervisor
 from hermes_cli.kanban_goal_operations import (
     OperationState,
@@ -696,6 +697,56 @@ def test_replayed_wedged_operation_does_not_spawn_another_worker(tmp_path, monke
     assert replay is None
     assert replay_elapsed < 0.1
     assert adapter.calls == 1
+
+
+def test_operation_gate_acquire_is_atomic_with_completed_gate_retirement(monkeypatch):
+    acquire_entered = threading.Event()
+    allow_acquire = threading.Event()
+    release_finished = threading.Event()
+
+    class _PausingGate:
+        def __init__(self) -> None:
+            self.held = True
+
+        def acquire(self, *, blocking: bool) -> bool:
+            assert blocking is False
+            acquire_entered.set()
+            assert allow_acquire.wait(timeout=1)
+            if self.held:
+                return False
+            self.held = True
+            return True
+
+        def release(self) -> None:
+            assert self.held
+            self.held = False
+
+    gate = _PausingGate()
+    monkeypatch.setattr(goal_operations, "_OPERATION_GATES", {"operation-1": gate})
+
+    acquired: list[object | None] = []
+    acquire_thread = threading.Thread(
+        target=lambda: acquired.append(
+            goal_operations._acquire_operation_gate("operation-1")
+        )
+    )
+    acquire_thread.start()
+    assert acquire_entered.wait(timeout=1)
+
+    def _release() -> None:
+        goal_operations._release_operation_gate("operation-1", gate)
+        release_finished.set()
+
+    release_thread = threading.Thread(target=_release)
+    release_thread.start()
+    assert not release_finished.wait(timeout=0.05)
+    allow_acquire.set()
+    acquire_thread.join(timeout=1)
+    release_thread.join(timeout=1)
+
+    assert acquired == [None]
+    assert release_finished.is_set()
+    assert "operation-1" not in goal_operations._OPERATION_GATES
 
 
 class _SequenceAdapter:

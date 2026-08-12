@@ -38,17 +38,18 @@ _OPERATION_GATES_LOCK = threading.Lock()
 _OPERATION_GATES: dict[str, threading.BoundedSemaphore] = {}
 
 
-def _operation_gate(operation_id: str) -> threading.BoundedSemaphore:
-    """Allow at most one live worker per durable operation.
+def _acquire_operation_gate(
+    operation_id: str,
+) -> threading.BoundedSemaphore | None:
+    """Atomically reserve the one live-worker slot for a durable operation.
 
     A timed-out daemon thread may be uncooperative, so later replay attempts
     for the same stable operation must not create an unbounded thread leak.
     Unrelated operations remain isolated even when they share an adapter ID.
     """
     with _OPERATION_GATES_LOCK:
-        return _OPERATION_GATES.setdefault(
-            operation_id, threading.BoundedSemaphore(1)
-        )
+        gate = _OPERATION_GATES.setdefault(operation_id, threading.BoundedSemaphore(1))
+        return gate if gate.acquire(blocking=False) else None
 
 
 def _release_operation_gate(
@@ -318,8 +319,8 @@ def execute_due_operation_once(
     adapter_id = str(operation.request_payload.get("adapter_id") or "")
     try:
         adapter = selected_registry.adapter(adapter_id)
-        gate = _operation_gate(operation.operation_id)
-        if not gate.acquire(blocking=False):
+        gate = _acquire_operation_gate(operation.operation_id)
+        if gate is None:
             raise AdapterExecutionTimeout(
                 f"trusted operation {operation.operation_id!r} is still running "
                 "after a prior deadline"
